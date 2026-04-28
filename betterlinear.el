@@ -2,11 +2,11 @@
 
 ;; Copyright (C) 2026
 
-;; Author: betterlinear contributors
+;; Author: Endi Sukaj
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "27.1") (org "9.0"))
 ;; Keywords: tools, projectmanagement
-;; URL: https://github.com/esukaj/betterlinear
+;; URL: https://github.com/Endi1/betterlinear
 
 ;;; Commentary:
 
