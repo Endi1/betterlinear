@@ -49,6 +49,11 @@ variable. Create an API key in Linear under Settings > API."
   :type 'string
   :group 'betterlinear)
 
+(defcustom betterlinear-needs-review-pull-requests-buffer-name "*Linear Needs Your Review*"
+  "Name of the Org buffer used by `betterlinear-needs-review-pull-requests-org'."
+  :type 'string
+  :group 'betterlinear)
+
 (defcustom betterlinear-issues-page-size 100
   "Number of issues to request per Linear API page."
   :type 'integer
@@ -157,6 +162,63 @@ not available, BetterLinear falls back to a small built-in converter."
   "query BetterLinearViewer {
      viewer { id name }
    }")
+
+(defcustom betterlinear-needs-review-pull-requests-queries
+  '((notifications . "query BetterLinearNeedsReviewNotifications($first: Int!, $after: String) {
+       notifications(first: $first, after: $after) {
+         nodes {
+           id
+           type
+           title
+           subtitle
+           url
+           inboxUrl
+           category
+           createdAt
+           updatedAt
+           readAt
+           archivedAt
+           ... on PullRequestNotification {
+             pullRequest {
+               id
+               title
+               url
+               createdAt
+               updatedAt
+               status
+               number
+               sourceBranch
+               targetBranch
+               creator { id name }
+             }
+           }
+         }
+         pageInfo { hasNextPage endCursor }
+       }
+     }"))
+  "GraphQL queries used to fetch pull requests needing your review.
+
+Each entry is `(KIND . QUERY)'. KIND controls how results are read. The default
+strategy uses Linear notifications and extracts pull requests from
+`PullRequestNotification' nodes.
+
+Supported KIND values:
+
+- `notifications' expects a top-level `notifications' connection whose nodes may
+  contain `PullRequestNotification' objects.
+- `pull-requests' expects a top-level `pullRequests' connection, for Linear
+  schemas that expose that field.
+- `pull-request-reviews' expects a top-level `pullRequestReviews' connection
+  whose nodes contain a `pullRequest' object, for schemas that expose that
+  field.
+
+Linear's public GraphQL schema varies and may not expose first-class pull
+request objects. Customize this if your workspace exposes different fields."
+  :type '(repeat (cons (choice (const notifications)
+                               (const pull-requests)
+                               (const pull-request-reviews))
+                       string))
+  :group 'betterlinear)
 
 (defvar betterlinear--projects-query
   "query BetterLinearProjects($first: Int!, $after: String) {
@@ -339,6 +401,148 @@ This follows Linear pagination until all assigned issues have been retrieved."
         (setq has-next (eq (alist-get 'hasNextPage page-info) t))
         (setq after (alist-get 'endCursor page-info))))
     issues))
+
+(defun betterlinear--pull-request-url-p (url)
+  "Return non-nil when URL looks like a pull/merge request URL."
+  (when-let* ((url (betterlinear--string url)))
+    (or (string-match-p "/pull/[0-9]+" url)
+        (string-match-p "/merge_requests/[0-9]+" url))))
+
+(defun betterlinear--notification-review-p (notification)
+  "Return non-nil when NOTIFICATION looks review-related."
+  (let ((haystack (downcase
+                   (string-join
+                    (delq nil
+                          (mapcar (lambda (key)
+                                    (betterlinear--string
+                                     (alist-get key notification)))
+                                  '(type category title subtitle)))
+                    " "))))
+    (or (string-match-p "review" haystack)
+        (string-match-p "pull" haystack)
+        (string-match-p "merge" haystack))))
+
+(defun betterlinear--pull-requests-from-notification (notification)
+  "Return pull requests extracted from NOTIFICATION."
+  (let ((pull-request (alist-get 'pullRequest notification)))
+    (cond
+     (pull-request
+      (list `((id . ,(or (alist-get 'id pull-request)
+                         (alist-get 'pullRequestId notification)
+                         (alist-get 'id notification)))
+              (title . ,(or (alist-get 'title pull-request)
+                            (alist-get 'title notification)))
+              (url . ,(or (alist-get 'url pull-request)
+                          (alist-get 'url notification)
+                          (alist-get 'inboxUrl notification)))
+              (createdAt . ,(or (alist-get 'createdAt pull-request)
+                                (alist-get 'createdAt notification)))
+              (updatedAt . ,(or (alist-get 'updatedAt pull-request)
+                                (alist-get 'updatedAt notification)))
+              (status . ,(alist-get 'status pull-request))
+              (number . ,(alist-get 'number pull-request))
+              (sourceBranch . ,(alist-get 'sourceBranch pull-request))
+              (targetBranch . ,(alist-get 'targetBranch pull-request))
+              (authorId . ,(alist-get 'id (alist-get 'creator pull-request)))
+              (author . ,(alist-get 'name (alist-get 'creator pull-request))))))
+     ((betterlinear--notification-review-p notification)
+      (let* ((issue (alist-get 'issue notification))
+             (attachments-connection (alist-get 'attachments issue))
+             (attachments (alist-get 'nodes attachments-connection))
+             prs)
+        (dolist (attachment attachments)
+          (when (betterlinear--pull-request-url-p (alist-get 'url attachment))
+            (push `((id . ,(or (alist-get 'id attachment)
+                               (alist-get 'id notification)))
+                    (title . ,(or (alist-get 'title attachment)
+                                  (alist-get 'title issue)
+                                  (alist-get 'identifier issue)))
+                    (url . ,(alist-get 'url attachment))
+                    (createdAt . ,(or (alist-get 'createdAt attachment)
+                                      (alist-get 'createdAt notification)))
+                    (updatedAt . ,(or (alist-get 'updatedAt attachment)
+                                      (alist-get 'updatedAt notification))))
+                  prs)))
+        (nreverse prs))))))
+
+(defun betterlinear--dedupe-pull-requests (pull-requests)
+  "Return PULL-REQUESTS deduplicated by URL or id."
+  (let (seen result)
+    (dolist (pull-request pull-requests)
+      (let ((key (or (betterlinear--string (alist-get 'url pull-request))
+                     (betterlinear--string (alist-get 'id pull-request)))))
+        (unless (member key seen)
+          (push key seen)
+          (push pull-request result))))
+    (nreverse result)))
+
+(defun betterlinear--needs-review-pull-requests-page-with-query (query-spec variables)
+  "Return one needs-review PR page using QUERY-SPEC and VARIABLES."
+  (pcase-let* ((`(,kind . ,query) query-spec)
+               (data (betterlinear--graphql query variables)))
+    (pcase kind
+      ('notifications
+       (let* ((connection (alist-get 'notifications data))
+              (notifications (alist-get 'nodes connection)))
+         (list :nodes (betterlinear--dedupe-pull-requests
+                       (apply #'append
+                              (mapcar #'betterlinear--pull-requests-from-notification
+                                      notifications)))
+               :page-info (alist-get 'pageInfo connection))))
+      ('pull-requests
+       (let ((connection (alist-get 'pullRequests data)))
+         (list :nodes (alist-get 'nodes connection)
+               :page-info (alist-get 'pageInfo connection))))
+      ('pull-request-reviews
+       (let* ((connection (alist-get 'pullRequestReviews data))
+              (review-nodes (alist-get 'nodes connection)))
+         (list :nodes (delq nil
+                            (mapcar (lambda (review)
+                                      (alist-get 'pullRequest review))
+                                    review-nodes))
+               :page-info (alist-get 'pageInfo connection))))
+      (_
+       (error "Unknown needs-review PR query kind: %S" kind)))))
+
+(defun betterlinear--needs-review-pull-requests-page (&optional after)
+  "Return one page of Linear pull requests needing your review after AFTER."
+  (let* ((viewer (betterlinear-viewer))
+         (viewer-id (alist-get 'id viewer))
+         (variables `((first . ,betterlinear-issues-page-size)
+                      (after . ,after)
+                      (viewerId . ,viewer-id)))
+         errors)
+    (catch 'page
+      (dolist (query-spec betterlinear-needs-review-pull-requests-queries)
+        (condition-case err
+            (throw 'page
+                   (append (betterlinear--needs-review-pull-requests-page-with-query
+                            query-spec variables)
+                           (list :viewer viewer)))
+          (error
+           (push (error-message-string err) errors))))
+      (error "Could not fetch Linear PRs needing review. Tried %d queries: %s"
+             (length betterlinear-needs-review-pull-requests-queries)
+             (string-join (nreverse errors) " | ")))))
+
+(defun betterlinear-needs-review-pull-requests ()
+  "Return Linear pull requests that need review from the authenticated user.
+
+This follows Linear pagination until all matching pull requests have been
+retrieved."
+  (let (after pull-requests viewer has-next)
+    (setq has-next t)
+    (while has-next
+      (let* ((page (betterlinear--needs-review-pull-requests-page after))
+             (page-viewer (plist-get page :viewer))
+             (nodes (plist-get page :nodes))
+             (page-info (plist-get page :page-info)))
+        (unless viewer
+          (setq viewer page-viewer))
+        (setq pull-requests (nconc pull-requests nodes))
+        (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+        (setq after (alist-get 'endCursor page-info))))
+    pull-requests))
 
 (defun betterlinear--string (value)
   "Return VALUE as a string, or nil for nil/JSON null."
@@ -655,6 +859,44 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
       (betterlinear--write-todo-keyword-line keywords)
       (betterlinear--set-local-todo-keywords keywords))))
 
+(defun betterlinear--insert-pr-property (name value)
+  "Insert Org property NAME with VALUE when VALUE is non-empty."
+  (betterlinear--insert-property name value))
+
+(defun betterlinear--insert-pull-request (pull-request)
+  "Insert PULL-REQUEST as an Org entry."
+  (let ((title (or (betterlinear--string (alist-get 'title pull-request))
+                   "Untitled pull request"))
+        (url (alist-get 'url pull-request)))
+    (insert (format "* REVIEW %s\n" (betterlinear--org-link url title)))
+    (insert ":PROPERTIES:\n")
+    (betterlinear--insert-pr-property "PR_ID" (alist-get 'id pull-request))
+    (betterlinear--insert-pr-property "PR_URL" (alist-get 'url pull-request))
+    (betterlinear--insert-pr-property "STATUS" (alist-get 'status pull-request))
+    (betterlinear--insert-pr-property "NUMBER" (alist-get 'number pull-request))
+    (betterlinear--insert-pr-property "SOURCE_BRANCH" (alist-get 'sourceBranch pull-request))
+    (betterlinear--insert-pr-property "TARGET_BRANCH" (alist-get 'targetBranch pull-request))
+    (betterlinear--insert-pr-property "AUTHOR_ID" (alist-get 'authorId pull-request))
+    (betterlinear--insert-pr-property "AUTHOR" (alist-get 'author pull-request))
+    (betterlinear--insert-pr-property "CREATED" (alist-get 'createdAt pull-request))
+    (betterlinear--insert-pr-property "UPDATED" (alist-get 'updatedAt pull-request))
+    (insert ":END:\n\n")))
+
+(defun betterlinear--insert-needs-review-pull-requests-org (pull-requests)
+  "Insert PULL-REQUESTS needing your review into the current buffer as Org." 
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (insert "#+TITLE: Linear pull requests needing your review\n")
+    (insert (format "#+DATE: %s\n" (format-time-string "%Y-%m-%d %H:%M:%S %Z")))
+    (insert "#+TODO: REVIEW\n")
+    (insert "#+STARTUP: overview\n\n")
+    (if pull-requests
+        (dolist (pull-request pull-requests)
+          (betterlinear--insert-pull-request pull-request))
+      (insert "No Linear pull requests need your review.\n"))
+    (betterlinear--set-local-todo-keywords '("REVIEW"))
+    (goto-char (point-min))))
+
 (defun betterlinear--insert-my-issues-org (issues)
   "Insert ISSUES into the current buffer as Org content."
   (let ((inhibit-read-only t)
@@ -674,6 +916,12 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
 (defun betterlinear--revert-my-issues-buffer (&rest _args)
   "Refresh the current BetterLinear issues buffer."
   (betterlinear--insert-my-issues-org (betterlinear-my-issues))
+  t)
+
+(defun betterlinear--revert-needs-review-pull-requests-buffer (&rest _args)
+  "Refresh the current BetterLinear pull requests buffer."
+  (betterlinear--insert-needs-review-pull-requests-org
+   (betterlinear-needs-review-pull-requests))
   t)
 
 (defun betterlinear--current-issue-id ()
@@ -1111,6 +1359,20 @@ a LINEAR_ID property, as entries generated by `betterlinear-my-issues-org' do."
     (betterlinear--replace-current-entry-with-issue issue)
     (message "Refreshed %s" (or (betterlinear--string (alist-get 'identifier issue))
                                 issue-id))))
+
+;;;###autoload
+(defun betterlinear-needs-review-pull-requests-org ()
+  "Retrieve Linear pull requests needing your review and show them in Org."
+  (interactive)
+  (let ((buffer (get-buffer-create betterlinear-needs-review-pull-requests-buffer-name)))
+    (with-current-buffer buffer
+      (betterlinear-org-mode)
+      (setq-local revert-buffer-function
+                  #'betterlinear--revert-needs-review-pull-requests-buffer)
+      (betterlinear--insert-needs-review-pull-requests-org
+       (betterlinear-needs-review-pull-requests))
+      (setq buffer-read-only t))
+    (pop-to-buffer buffer)))
 
 ;;;###autoload
 (defun betterlinear-my-issues-org ()

@@ -16,6 +16,7 @@ An Emacs package for working with [Linear](https://linear.app) issues from Org m
 - Assign the issue at point to yourself.
 - Create a Linear issue from an Org entry.
 - Copy the Linear/git branch name for the issue at point.
+- Fetch pull requests that need your review.
 - Convert descriptions between Markdown and Org.
   - Uses Pandoc when available.
   - Falls back to a small built-in converter for links, headings, and code blocks.
@@ -198,6 +199,20 @@ Copies the issue branch name to the kill ring.
 
 If Linear returns `branchName`, that value is used. If Linear does not return a branch name, BetterLinear generates one from the issue identifier and title using `betterlinear-branch-name-format`.
 
+### Show pull requests needing your review
+
+```elisp
+M-x betterlinear-needs-review-pull-requests-org
+```
+
+Fetches Linear pull requests in the “Needs your review” bucket and displays them in an Org buffer.
+
+For Lisp callers:
+
+```elisp
+(betterlinear-needs-review-pull-requests)
+```
+
 ### Create a Linear issue from an Org entry
 
 ```elisp
@@ -243,12 +258,14 @@ Interactive commands:
 | `betterlinear-set-me-as-owner-at-point` | Assign the issue at point to yourself. |
 | `betterlinear-copy-git-branch-at-point` | Copy the issue branch name. |
 | `betterlinear-create-issue-from-org-entry` | Create a Linear issue from the current Org entry. |
+| `betterlinear-needs-review-pull-requests-org` | Show PRs needing your review in an Org buffer. |
 
 Lower-level functions:
 
 | Function | Description |
 | --- | --- |
 | `betterlinear-my-issues` | Return assigned issues as Lisp data. |
+| `betterlinear-needs-review-pull-requests` | Return PRs needing your review as Lisp data. |
 | `betterlinear-issue` | Fetch a single issue. |
 | `betterlinear-projects` | Fetch visible projects. |
 | `betterlinear-teams` | Fetch visible teams. |
