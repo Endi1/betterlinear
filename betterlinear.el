@@ -528,6 +528,11 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
                 markdown))
          in-fence
          lines)
+    (setq text (replace-regexp-in-string
+                "`\\([^`\n]+\\)`"
+                "=\\1="
+                text))
+    (setq lines nil)
     (dolist (line (split-string text "\n"))
       (cond
        ((string-match "\\`[[:space:]]*\\(```\\|~~~\\)\\([^\n]*\\)\\'" line)
@@ -557,6 +562,10 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
     (setq text (replace-regexp-in-string
                 "\\[\\[\\([^]\n]+\\)\\]\\[\\([^]\n]+\\)\\]\\]"
                 "[\\2](\\1)"
+                text))
+    (setq text (replace-regexp-in-string
+                "=\\([^=\n]+\\)="
+                "`\\1`"
                 text))
     (with-temp-buffer
       (insert text)
@@ -690,17 +699,36 @@ BetterLinear."
           (user-error "Current Org entry has an empty heading")
         title))))
 
+(defun betterlinear--normalize-org-body-headings (org parent-level)
+  "Normalize heading levels in ORG relative to PARENT-LEVEL.
+
+When creating a Linear story from an Org subtree, the subtree's child headings
+are part of the story body. This turns an immediate child heading into a level-1
+heading for the description before converting it to Markdown."
+  (with-temp-buffer
+    (insert org)
+    (goto-char (point-min))
+    (while (re-search-forward "^\\(\\*+\\)\\([[:space:]]+\\)" nil t)
+      (let* ((stars (length (match-string 1)))
+             (relative-level (max 1 (- stars parent-level))))
+        (replace-match (concat (make-string relative-level ?*)
+                               (match-string 2))
+                       t t)))
+    (buffer-string)))
+
 (defun betterlinear--current-org-entry-description ()
   "Return the current Org entry body as a Linear Markdown description, or nil.
 
-The description starts after the heading, planning line, and property drawer,
-stops before the first child heading, and is converted from Org to Markdown."
+The description starts after the entry heading, planning line, and property
+drawer, includes child subtrees, and is converted from Org to Markdown. Child
+heading levels are normalized relative to the current entry before conversion."
   (unless (derived-mode-p 'org-mode)
     (user-error "This command must be run from an Org buffer"))
   (save-excursion
     (org-back-to-heading t)
-    (let* ((subtree-end (save-excursion (org-end-of-subtree t t) (point)))
-           beg end description)
+    (let* ((parent-level (org-outline-level))
+           (subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+           beg description)
       (forward-line 1)
       (while (and (< (point) subtree-end)
                   (looking-at-p org-planning-line-re))
@@ -711,13 +739,10 @@ stops before the first child heading, and is converted from Org to Markdown."
             (forward-line 1)
           (user-error "Malformed property drawer in current Org entry")))
       (setq beg (point))
-      (setq end (or (save-excursion
-                      (when (re-search-forward org-outline-regexp-bol subtree-end t)
-                        (line-beginning-position)))
-                    subtree-end))
-      (setq description (string-trim (buffer-substring-no-properties beg end)))
+      (setq description (string-trim (buffer-substring-no-properties beg subtree-end)))
       (unless (string-empty-p description)
-        (betterlinear-org-to-markdown description)))))
+        (betterlinear-org-to-markdown
+         (betterlinear--normalize-org-body-headings description parent-level))))))
 
 (defun betterlinear--current-subtree-region-and-level ()
   "Return `(BEG END LEVEL)' for the current Org subtree."
