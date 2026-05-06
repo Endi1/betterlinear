@@ -22,6 +22,7 @@
 (require 'org)
 (require 'seq)
 (require 'subr-x)
+(require 'thingatpt)
 (require 'url)
 (require 'url-http)
 
@@ -46,6 +47,11 @@ variable. Create an API key in Linear under Settings > API."
 
 (defcustom betterlinear-my-issues-buffer-name "*Linear My Issues*"
   "Name of the Org buffer used by `betterlinear-my-issues-org'."
+  :type 'string
+  :group 'betterlinear)
+
+(defcustom betterlinear-my-non-done-issues-buffer-name "*Linear My Non-Done Issues*"
+  "Name of the Org buffer used by `betterlinear-my-non-done-issues-org'."
   :type 'string
   :group 'betterlinear)
 
@@ -340,11 +346,13 @@ request objects. Customize this if your workspace exposes different fields."
 (defun betterlinear--graphql (query &optional variables)
   "Run Linear GraphQL QUERY with VARIABLES and return the `data' alist."
   (let* ((url-request-method "POST")
-         (url-request-extra-headers `(("Content-Type" . "application/json")
+         (url-request-extra-headers `(("Content-Type" . "application/json; charset=utf-8")
                                       ("Authorization" . ,(betterlinear--api-key))))
          (url-request-data
-          (json-encode `((query . ,query)
-                         (variables . ,(or variables '())))))
+          (encode-coding-string
+           (json-encode `((query . ,query)
+                          (variables . ,(or variables '()))))
+           'utf-8))
          (buffer (url-retrieve-synchronously betterlinear-api-url t t 30)))
     (unless buffer
       (error "Linear API request timed out"))
@@ -401,6 +409,24 @@ This follows Linear pagination until all assigned issues have been retrieved."
         (setq has-next (eq (alist-get 'hasNextPage page-info) t))
         (setq after (alist-get 'endCursor page-info))))
     issues))
+
+(defun betterlinear--issue-done-p (issue)
+  "Return non-nil when Linear ISSUE is in a done/completed state."
+  (let* ((state (alist-get 'state issue))
+         (state-type (downcase (or (betterlinear--string (alist-get 'type state))
+                                   "")))
+         (state-name (downcase (or (betterlinear--string (alist-get 'name state))
+                                   ""))))
+    (or (string= state-type "completed")
+        (string= state-name "done"))))
+
+(defun betterlinear-my-non-done-issues ()
+  "Return assigned Linear issues whose workflow state is not done.
+
+This fetches all issues assigned to the authenticated user with
+`betterlinear-my-issues', then removes issues whose Linear state type is
+`completed' or whose state name is `Done'."
+  (seq-remove #'betterlinear--issue-done-p (betterlinear-my-issues)))
 
 (defun betterlinear--pull-request-url-p (url)
   "Return non-nil when URL looks like a pull/merge request URL."
@@ -897,25 +923,35 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
     (betterlinear--set-local-todo-keywords '("REVIEW"))
     (goto-char (point-min))))
 
-(defun betterlinear--insert-my-issues-org (issues)
-  "Insert ISSUES into the current buffer as Org content."
+(defun betterlinear--insert-my-issues-org (issues &optional title empty-message)
+  "Insert ISSUES into the current buffer as Org content.
+
+TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil."
   (let ((inhibit-read-only t)
         (todo-keywords (betterlinear--todo-keywords-for-issues issues)))
     (erase-buffer)
-    (insert "#+TITLE: Linear issues assigned to me\n")
+    (insert (format "#+TITLE: %s\n" (or title "Linear issues assigned to me")))
     (insert (format "#+DATE: %s\n" (format-time-string "%Y-%m-%d %H:%M:%S %Z")))
     (insert (format "#+TODO: %s\n" (string-join todo-keywords " ")))
     (insert "#+STARTUP: overview\n\n")
     (if issues
         (dolist (issue issues)
           (betterlinear--insert-issue issue))
-      (insert "No assigned Linear issues found.\n"))
+      (insert (or empty-message "No assigned Linear issues found.\n")))
     (betterlinear--set-local-todo-keywords todo-keywords)
     (goto-char (point-min))))
 
 (defun betterlinear--revert-my-issues-buffer (&rest _args)
   "Refresh the current BetterLinear issues buffer."
   (betterlinear--insert-my-issues-org (betterlinear-my-issues))
+  t)
+
+(defun betterlinear--revert-my-non-done-issues-buffer (&rest _args)
+  "Refresh the current BetterLinear non-done issues buffer."
+  (betterlinear--insert-my-issues-org
+   (betterlinear-my-non-done-issues)
+   "Linear non-done issues assigned to me"
+   "No non-done assigned Linear issues found.\n")
   t)
 
 (defun betterlinear--revert-needs-review-pull-requests-buffer (&rest _args)
@@ -1015,6 +1051,17 @@ heading levels are normalized relative to the current entry before conversion."
       (betterlinear--ensure-todo-keyword todo-keyword)
       (goto-char heading-marker)
       (set-marker heading-marker nil))))
+
+(defun betterlinear--org-entry-insertion-level ()
+  "Return a suitable Org heading level for inserting an issue at point."
+  (if (derived-mode-p 'org-mode)
+      (save-excursion
+        (condition-case nil
+            (progn
+              (org-back-to-heading t)
+              (org-outline-level))
+          (error 1)))
+    1))
 
 (defun betterlinear--projects-page (&optional after)
   "Return one page of Linear projects after cursor AFTER."
@@ -1143,6 +1190,33 @@ Return the created issue."
     (unless issue
       (user-error "Linear issue not found: %s" issue-id))
     issue))
+
+(defun betterlinear--issue-id-from-url (url)
+  "Return the Linear issue id or identifier found in URL.
+
+URL may be a normal Linear issue URL, such as
+https://linear.app/acme/issue/ENG-123/fix-login, or an issue identifier like
+ENG-123.  Signal a user error when no issue id can be found."
+  (let* ((url (string-trim (or (betterlinear--string url) "")))
+         (case-fold-search t))
+    (cond
+     ((string-empty-p url)
+      (user-error "No Linear issue URL provided"))
+     ((string-match "\\`[[:alnum:]]+-[0-9]+\\'" url)
+      (match-string 0 url))
+     ((string-match "/issue/\\([^/?#]+\\)" url)
+      (let ((segment (url-unhex-string (match-string 1 url))))
+        (if (string-match "\\`\\([[:alnum:]]+-[0-9]+\\)\\(?:-.*\\)?\\'" segment)
+            (match-string 1 segment)
+          segment)))
+     ((string-match "\\(?:\\`\\|[/?#&=]\\)\\([[:alnum:]]+-[0-9]+\\)\\(?:\\'\\|[/?#&=]\\)" url)
+      (match-string 1 url))
+     (t
+      (user-error "Could not find a Linear issue id in URL: %s" url)))))
+
+(defun betterlinear-issue-from-url (url)
+  "Return the latest Linear issue data for the issue identified by URL."
+  (betterlinear-issue (betterlinear--issue-id-from-url url)))
 
 (defun betterlinear--issue-with-states (issue-id)
   "Return Linear issue ISSUE-ID, including its team's workflow states."
@@ -1348,6 +1422,38 @@ keeping the same heading level."
                  (betterlinear--string (alist-get 'id issue))))))
 
 ;;;###autoload
+(defun betterlinear-insert-issue-from-url (url &optional level)
+  "Fetch a Linear issue by URL and insert it as an Org entry at point.
+
+Interactively, prompt for a Linear issue URL, defaulting to the URL at point
+when there is one.  The command must be run from an Org buffer.  The inserted
+entry uses the current heading level when point is inside a subtree, otherwise
+level 1.  Lisp callers may pass LEVEL to choose the heading level explicitly."
+  (interactive
+   (list (read-string "Linear issue URL: "
+                      (or (thing-at-point 'url t) ""))))
+  (unless (derived-mode-p 'org-mode)
+    (user-error "This command must be run from an Org buffer"))
+  (let* ((issue (betterlinear-issue-from-url url))
+         (identifier (or (betterlinear--string (alist-get 'identifier issue))
+                         (betterlinear--string (alist-get 'id issue))))
+         (todo-keyword (betterlinear--todo-keyword
+                        (alist-get 'name (alist-get 'state issue))))
+         (level (or level (betterlinear--org-entry-insertion-level)))
+         (inhibit-read-only t)
+         beg
+         heading-marker)
+    (unless (bolp)
+      (insert "\n"))
+    (setq beg (point))
+    (betterlinear--insert-issue issue level)
+    (setq heading-marker (copy-marker beg t))
+    (betterlinear--ensure-todo-keyword todo-keyword)
+    (goto-char heading-marker)
+    (set-marker heading-marker nil)
+    (message "Inserted Linear issue %s" identifier)))
+
+;;;###autoload
 (defun betterlinear-refresh-issue-at-point ()
   "Fetch the latest Linear story for the Org entry at point and replace it.
 
@@ -1371,6 +1477,22 @@ a LINEAR_ID property, as entries generated by `betterlinear-my-issues-org' do."
                   #'betterlinear--revert-needs-review-pull-requests-buffer)
       (betterlinear--insert-needs-review-pull-requests-org
        (betterlinear-needs-review-pull-requests))
+      (setq buffer-read-only t))
+    (pop-to-buffer buffer)))
+
+;;;###autoload
+(defun betterlinear-my-non-done-issues-org ()
+  "Retrieve non-done Linear issues assigned to you and show them in Org."
+  (interactive)
+  (let ((buffer (get-buffer-create betterlinear-my-non-done-issues-buffer-name)))
+    (with-current-buffer buffer
+      (betterlinear-org-mode)
+      (setq-local revert-buffer-function
+                  #'betterlinear--revert-my-non-done-issues-buffer)
+      (betterlinear--insert-my-issues-org
+       (betterlinear-my-non-done-issues)
+       "Linear non-done issues assigned to me"
+       "No non-done assigned Linear issues found.\n")
       (setq buffer-read-only t))
     (pop-to-buffer buffer)))
 

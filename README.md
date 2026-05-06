@@ -7,6 +7,8 @@ An Emacs package for working with [Linear](https://linear.app) issues from Org m
 ## Features
 
 - Fetch all Linear issues assigned to you into an Org-mode buffer.
+- Fetch assigned issues that are not done as Lisp data.
+- Pull a single Linear issue by URL into the current Org buffer.
 - Render each Linear issue as an Org heading with a property drawer.
 - Use Linear workflow state names as Org TODO keywords.
   - Example: `In Progress` becomes `IN-PROGRESS`.
@@ -145,6 +147,31 @@ Description converted from Linear Markdown into Org.
 
 The generated buffer uses `betterlinear-org-mode`, derived from `org-mode`. You can refresh it with `revert-buffer`.
 
+### Show my assigned non-done Linear issues
+
+```elisp
+M-x betterlinear-my-non-done-issues-org
+```
+
+This creates or refreshes a buffer named `*Linear My Non-Done Issues*` containing assigned issues whose Linear workflow state is not done/completed.
+
+For Lisp callers:
+
+```elisp
+(betterlinear-my-non-done-issues)
+```
+
+### Pull an issue by URL into Org
+
+```elisp
+M-x betterlinear-insert-issue-from-url
+```
+
+Prompts for a Linear issue URL, fetches the issue, and inserts it as an Org entry at point.
+When point is inside an Org subtree, the inserted entry uses the current heading level; otherwise it uses a top-level heading.
+
+The URL may be a full Linear URL such as `https://linear.app/acme/issue/ENG-123/fix-login`, or just an issue identifier like `ENG-123`.
+
 ### Refresh the issue at point
 
 ```elisp
@@ -252,6 +279,8 @@ Interactive commands:
 | Command | Description |
 | --- | --- |
 | `betterlinear-my-issues-org` | Show assigned Linear issues in an Org buffer. |
+| `betterlinear-my-non-done-issues-org` | Show assigned non-done Linear issues in an Org buffer. |
+| `betterlinear-insert-issue-from-url` | Pull a Linear issue by URL and insert it as an Org entry. |
 | `betterlinear-refresh-issue-at-point` | Refresh current Org entry from Linear. |
 | `betterlinear-set-issue-state-at-point` | Change the Linear workflow state for the issue at point. |
 | `betterlinear-set-project-at-point` | Set the Linear project for the issue at point. |
@@ -265,8 +294,10 @@ Lower-level functions:
 | Function | Description |
 | --- | --- |
 | `betterlinear-my-issues` | Return assigned issues as Lisp data. |
+| `betterlinear-my-non-done-issues` | Return assigned issues whose workflow state is not done. |
 | `betterlinear-needs-review-pull-requests` | Return PRs needing your review as Lisp data. |
 | `betterlinear-issue` | Fetch a single issue. |
+| `betterlinear-issue-from-url` | Fetch a single issue from a Linear URL or identifier. |
 | `betterlinear-projects` | Fetch visible projects. |
 | `betterlinear-teams` | Fetch visible teams. |
 | `betterlinear-viewer` | Fetch authenticated Linear user. |
