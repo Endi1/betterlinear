@@ -8,6 +8,7 @@ An Emacs package for working with [Linear](https://linear.app) issues from Org m
 
 - Fetch all Linear issues assigned to you into an Org-mode buffer.
 - Fetch assigned issues that are not done as Lisp data.
+- Fetch all Linear stories from a project into an Org-mode buffer or as Lisp data, ordered by the project's Linear sort order.
 - Pull a single Linear issue by URL into the current Org buffer.
 - Render each Linear issue as an Org heading with a property drawer.
 - Use Linear workflow state names as Org TODO keywords.
@@ -78,6 +79,7 @@ If `betterlinear-api-key` is nil, BetterLinear uses `LINEAR_API_KEY`.
 
 ```elisp
 (setq betterlinear-my-issues-buffer-name "*Linear My Issues*")
+(setq betterlinear-project-stories-buffer-name "*Linear Project Stories*")
 (setq betterlinear-issues-page-size 100)
 ```
 
@@ -159,6 +161,20 @@ For Lisp callers:
 
 ```elisp
 (betterlinear-my-non-done-issues)
+```
+
+### Show stories from a project
+
+```elisp
+M-x betterlinear-project-stories-org
+```
+
+Prompts for a Linear project and displays all stories/issues in that project as Org entries, ordered the same way as in the Linear project.
+
+For Lisp callers:
+
+```elisp
+(betterlinear-project-stories "project-id")
 ```
 
 ### Pull an issue by URL into Org
@@ -280,6 +296,8 @@ Interactive commands:
 | --- | --- |
 | `betterlinear-my-issues-org` | Show assigned Linear issues in an Org buffer. |
 | `betterlinear-my-non-done-issues-org` | Show assigned non-done Linear issues in an Org buffer. |
+| `betterlinear-project-stories-org` | Show all stories from a Linear project in an Org buffer, ordered by project order. |
+| `betterlinear-project-stories` | Prompt for a Linear project and fetch its stories as Lisp data, ordered by project order. |
 | `betterlinear-insert-issue-from-url` | Pull a Linear issue by URL and insert it as an Org entry. |
 | `betterlinear-refresh-issue-at-point` | Refresh current Org entry from Linear. |
 | `betterlinear-set-issue-state-at-point` | Change the Linear workflow state for the issue at point. |
@@ -295,6 +313,7 @@ Lower-level functions:
 | --- | --- |
 | `betterlinear-my-issues` | Return assigned issues as Lisp data. |
 | `betterlinear-my-non-done-issues` | Return assigned issues whose workflow state is not done. |
+| `betterlinear-project-stories` | Return all stories from a Linear project, ordered by project order. |
 | `betterlinear-needs-review-pull-requests` | Return PRs needing your review as Lisp data. |
 | `betterlinear-issue` | Fetch a single issue. |
 | `betterlinear-issue-from-url` | Fetch a single issue from a Linear URL or identifier. |
