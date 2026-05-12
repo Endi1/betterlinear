@@ -18,6 +18,7 @@ An Emacs package for working with [Linear](https://linear.app) issues from Org m
 - Set the Linear project for the issue at point.
 - Assign the issue at point to yourself.
 - Create a Linear issue from an Org entry.
+- Capture a new Linear issue in a temporary Org buffer without saving an Org entry.
 - Copy the Linear/git branch name for the issue at point.
 - Fetch pull requests that need your review.
 - Convert descriptions between Markdown and Org.
@@ -288,6 +289,21 @@ We should retry failed billing webhooks.
 
 Running `betterlinear-create-issue-from-org-entry` creates the Linear issue and replaces the entry with a Linear-backed entry containing `LINEAR_ID` and related properties.
 
+### Capture a Linear issue without a permanent Org entry
+
+```elisp
+M-x betterlinear-capture-issue
+```
+
+This prompts for a Linear team, then opens a temporary Org buffer with a single
+issue entry. Edit the heading for the Linear title and add an optional body for
+the Linear description.
+
+- `C-c C-c` creates the Linear issue and kills the temporary buffer.
+- `C-c C-k` aborts the capture without creating anything.
+
+No Org entry is written to a file or permanent Org buffer.
+
 ## Commands
 
 Interactive commands:
@@ -305,6 +321,7 @@ Interactive commands:
 | `betterlinear-set-me-as-owner-at-point` | Assign the issue at point to yourself. |
 | `betterlinear-copy-git-branch-at-point` | Copy the issue branch name. |
 | `betterlinear-create-issue-from-org-entry` | Create a Linear issue from the current Org entry. |
+| `betterlinear-capture-issue` | Capture a new Linear issue in a temporary Org buffer. |
 | `betterlinear-needs-review-pull-requests-org` | Show PRs needing your review in an Org buffer. |
 
 Lower-level functions:
