@@ -8,6 +8,7 @@ An Emacs package for working with [Linear](https://linear.app) issues from Org m
 
 - Fetch all Linear issues assigned to you into an Org-mode buffer.
 - Fetch assigned issues that are not done as Lisp data.
+- Search Linear issues for a selected team and show the results in Org.
 - Fetch all Linear stories from a project into an Org-mode buffer or as Lisp data, ordered by the project's Linear sort order.
 - Pull a single Linear issue by URL into the current Org buffer.
 - Render each Linear issue as an Org heading with a property drawer.
@@ -164,6 +165,28 @@ For Lisp callers:
 (betterlinear-my-non-done-issues)
 ```
 
+### Search issues for a team
+
+```elisp
+M-x betterlinear-search-team-issues-org
+```
+
+Prompts for a Linear team first, then prompts for a search term. Matching issues
+for that team are displayed in an Org buffer. Leave the search term empty to show
+all issues for the selected team.
+
+For Lisp callers:
+
+```elisp
+(betterlinear-search-team-issues "team-id" "login")
+```
+
+Alias:
+
+```elisp
+M-x betterlinear-search-team-tickets-org
+```
+
 ### Show stories from a project
 
 ```elisp
@@ -312,6 +335,8 @@ Interactive commands:
 | --- | --- |
 | `betterlinear-my-issues-org` | Show assigned Linear issues in an Org buffer. |
 | `betterlinear-my-non-done-issues-org` | Show assigned non-done Linear issues in an Org buffer. |
+| `betterlinear-search-team-issues-org` | Search issues for a selected team and show them in an Org buffer. |
+| `betterlinear-search-team-tickets-org` | Alias for `betterlinear-search-team-issues-org`. |
 | `betterlinear-project-stories-org` | Show all stories from a Linear project in an Org buffer, ordered by project order. |
 | `betterlinear-project-stories` | Prompt for a Linear project and fetch its stories as Lisp data, ordered by project order. |
 | `betterlinear-insert-issue-from-url` | Pull a Linear issue by URL and insert it as an Org entry. |
@@ -330,6 +355,7 @@ Lower-level functions:
 | --- | --- |
 | `betterlinear-my-issues` | Return assigned issues as Lisp data. |
 | `betterlinear-my-non-done-issues` | Return assigned issues whose workflow state is not done. |
+| `betterlinear-search-team-issues` | Return issues matching a search term for a team. |
 | `betterlinear-project-stories` | Return all stories from a Linear project, ordered by project order. |
 | `betterlinear-needs-review-pull-requests` | Return PRs needing your review as Lisp data. |
 | `betterlinear-issue` | Fetch a single issue. |

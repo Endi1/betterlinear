@@ -60,6 +60,11 @@ variable. Create an API key in Linear under Settings > API."
   :type 'string
   :group 'betterlinear)
 
+(defcustom betterlinear-team-search-buffer-name "*Linear Team Search*"
+  "Name of the Org buffer used by `betterlinear-search-team-issues-org'."
+  :type 'string
+  :group 'betterlinear)
+
 (defcustom betterlinear-needs-review-pull-requests-buffer-name "*Linear Needs Your Review*"
   "Name of the Org buffer used by `betterlinear-needs-review-pull-requests-org'."
   :type 'string
@@ -113,6 +118,15 @@ not available, BetterLinear falls back to a small built-in converter."
 
 (defvar-local betterlinear--capture-team-id nil
   "Linear team id selected for the current temporary capture buffer.")
+
+(defvar-local betterlinear--team-search-buffer-team-id nil
+  "Linear team id used to refresh the current team search buffer.")
+
+(defvar-local betterlinear--team-search-buffer-term nil
+  "Search term used to refresh the current team search buffer.")
+
+(defvar-local betterlinear--team-search-buffer-title nil
+  "Org title used to refresh the current team search buffer.")
 
 (defvar betterlinear--my-issues-query
   "query BetterLinearMyIssues($first: Int!, $after: String) {
@@ -269,6 +283,37 @@ request objects. Customize this if your workspace exposes different fields."
            url
            branchName
            sortOrder
+           priority
+           priorityLabel
+           estimate
+           createdAt
+           updatedAt
+           dueDate
+           assignee { id name }
+           team { id key name }
+           state { id name type }
+           project { id name url }
+         }
+         pageInfo { hasNextPage endCursor }
+       }
+     }
+   }")
+
+(defvar betterlinear--team-issues-query
+  "query BetterLinearTeamIssues($teamId: String!, $first: Int!, $after: String) {
+     team(id: $teamId) {
+       id
+       key
+       name
+       issues(first: $first, after: $after) {
+         nodes {
+           id
+           identifier
+           title
+           description
+           descriptionState
+           url
+           branchName
            priority
            priorityLabel
            estimate
@@ -830,6 +875,18 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
                 "`\\([^`\n]+\\)`"
                 "=\\1="
                 text))
+    (setq text (replace-regexp-in-string
+                "\\(^\\|[[:space:]]\\)\\*\\([^*[:space:]\n][^*\n]*[^*[:space:]\n]\\)\\*\\($\\|[[:space:][:punct:]]\\)"
+                "\\1/\\2/\\3"
+                text))
+    (setq text (replace-regexp-in-string
+                "\\*\\*\\([^*\n]+\\)\\*\\*"
+                "*\\1*"
+                text))
+    (setq text (replace-regexp-in-string
+                "__\\([^_\n]+\\)__"
+                "*\\1*"
+                text))
     (setq lines nil)
     (dolist (line (split-string text "\n"))
       (cond
@@ -865,6 +922,14 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
                 "=\\([^=\n]+\\)="
                 "`\\1`"
                 text))
+    (setq text (replace-regexp-in-string
+                "\\(^\\|[[:space:]]\\)\\*\\([^*[:space:]\n][^*\n]*[^*[:space:]\n]\\)\\*\\($\\|[[:space:][:punct:]]\\)"
+                "\\1**\\2**\\3"
+                text))
+    (setq text (replace-regexp-in-string
+                "\\(^\\|[[:space:]]\\)/\\([^/[:space:]\n][^/\n]*[^/[:space:]\n]\\)/\\($\\|[[:space:][:punct:]]\\)"
+                "\\1*\\2*\\3"
+                text))
     (with-temp-buffer
       (insert text)
       (goto-char (point-min))
@@ -879,11 +944,61 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
                        t t))
       (string-trim-right (buffer-string)))))
 
+(defun betterlinear--trim-link-delimiters (value)
+  "Return VALUE without surrounding Org/Markdown link delimiters."
+  (let ((value (string-trim (or value ""))))
+    (while (and (> (length value) 0)
+                (memq (aref value 0) '(?\[ ?<)))
+      (setq value (substring value 1)))
+    (while (and (> (length value) 0)
+                (memq (aref value (1- (length value))) '(?\] ?>)))
+      (setq value (substring value 0 -1)))
+    value))
+
+(defun betterlinear--same-url-p (left right)
+  "Return non-nil when LEFT and RIGHT are the same URL string."
+  (string= (betterlinear--trim-link-delimiters left)
+           (betterlinear--trim-link-delimiters right)))
+
+(defun betterlinear--normalize-markdown-links-before-org (markdown)
+  "Normalize MARKDOWN links that otherwise round-trip poorly through Pandoc.
+
+In particular, Pandoc converts Markdown links like `[<URL>](URL)' to Org links
+whose description is another Org link.  That happens when Org bare links are
+converted to Markdown and then back again.  Collapse self-links to Markdown
+autolinks before conversion so they become simple Org links."
+  (with-temp-buffer
+    (insert markdown)
+    (goto-char (point-min))
+    (while (re-search-forward "\\[<?\\(https?://[^]\n>]+\\)>?\\](\\(https?://[^)\n]+\\))" nil t)
+      (let ((label (match-string 1))
+            (url (match-string 2)))
+        (when (betterlinear--same-url-p label url)
+          (replace-match (format "<%s>" url) t t))))
+    (goto-char (point-min))
+    (while (re-search-forward "\\[\\[\\(https?://[^]\n]+\\)\\]\\]" nil t)
+      (replace-match (format "<%s>" (match-string 1)) t t))
+    (buffer-string)))
+
+(defun betterlinear--normalize-org-self-links (org)
+  "Collapse Org links whose description is the same URL as their target."
+  (with-temp-buffer
+    (insert org)
+    (goto-char (point-min))
+    (while (re-search-forward "\\[\\[\\([^]\n]+\\)\\]\\[\\(?:\\[\\[\\)?<?\\([^]\n>]+\\)>?\\(?:\\]\\]\\)?\\]\\]" nil t)
+      (let ((url (match-string 1))
+            (description (match-string 2)))
+        (when (betterlinear--same-url-p url description)
+          (replace-match (format "[[%s]]" url) t t))))
+    (buffer-string)))
+
 (defun betterlinear-markdown-to-org (markdown)
   "Convert Linear MARKDOWN text to Org text."
-  (if (betterlinear--pandoc-available-p)
-      (betterlinear--pandoc-convert markdown "gfm" "org")
-    (betterlinear--fallback-markdown-to-org markdown)))
+  (let* ((markdown (betterlinear--normalize-markdown-links-before-org markdown))
+         (org (if (betterlinear--pandoc-available-p)
+                  (betterlinear--pandoc-convert markdown "gfm" "org")
+                (betterlinear--fallback-markdown-to-org markdown))))
+    (betterlinear--normalize-org-self-links org)))
 
 (defun betterlinear-org-to-markdown (org)
   "Convert ORG text to Markdown for Linear."
@@ -891,19 +1006,51 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
       (betterlinear--pandoc-convert org "org" "gfm")
     (betterlinear--fallback-org-to-markdown org)))
 
-(defun betterlinear--insert-issue-description (issue)
-  "Insert Linear ISSUE's description as the Org entry body."
+(defun betterlinear--denormalize-org-body-headings (org parent-level)
+  "Shift ORG body headings so they are children of PARENT-LEVEL.
+
+Linear descriptions are standalone Markdown documents, so a Markdown `# Heading'
+converts to an Org `* Heading'.  Inside an issue entry, that heading must become
+a child of the issue heading instead of a sibling."
+  (with-temp-buffer
+    (insert org)
+    (goto-char (point-min))
+    (while (re-search-forward "^\\(\\*+\\)\\([[:space:]]+\\)" nil t)
+      (replace-match (concat (make-string (+ parent-level
+                                             (length (match-string 1)))
+                                          ?*)
+                             (match-string 2))
+                     t t))
+    (buffer-string)))
+
+(defun betterlinear--insert-issue-description (issue &optional level)
+  "Insert Linear ISSUE's Markdown description as an Org entry body.
+
+The Markdown description is always converted to Org.  Any headings in the
+converted body are shifted below the issue heading at LEVEL."
   (when-let* ((description (betterlinear--issue-description issue))
               (description (string-trim description))
               (_ (not (string-empty-p description))))
-    (insert "\n" (betterlinear-markdown-to-org description) "\n")))
+    (insert "\n"
+            (betterlinear--denormalize-org-body-headings
+             (betterlinear-markdown-to-org description)
+             (or level 1))
+            "\n")))
 
-(defun betterlinear--insert-issue (issue &optional level)
-  "Insert Linear ISSUE as an Org entry at heading LEVEL."
-  (insert (betterlinear--issue-heading issue level))
-  (betterlinear--insert-issue-properties issue)
-  (betterlinear--insert-issue-description issue)
-  (insert "\n"))
+(defun betterlinear--insert-issue (issue &optional level planning)
+  "Insert Linear ISSUE as an Org entry at heading LEVEL.
+
+When PLANNING is non-nil, insert it as Org planning metadata immediately after
+the heading."
+  (let ((level (or level 1)))
+    (insert (betterlinear--issue-heading issue level))
+    (when (and planning (not (string-empty-p planning)))
+      (insert planning)
+      (unless (string-suffix-p "\n" planning)
+        (insert "\n")))
+    (betterlinear--insert-issue-properties issue)
+    (betterlinear--insert-issue-description issue level)
+    (insert "\n")))
 
 (defun betterlinear--todo-keywords-for-issues (issues)
   "Return unique Org TODO keywords for the Linear state names in ISSUES."
@@ -996,7 +1143,8 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
 
 TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil."
   (let ((inhibit-read-only t)
-        (todo-keywords (betterlinear--todo-keywords-for-issues issues)))
+        (todo-keywords (betterlinear--todo-keywords-for-issues issues))
+        (planning-map (betterlinear--org-entry-planning-map)))
     (erase-buffer)
     (insert (format "#+TITLE: %s\n" (or title "Linear issues assigned to me")))
     (insert (format "#+DATE: %s\n" (format-time-string "%Y-%m-%d %H:%M:%S %Z")))
@@ -1004,7 +1152,10 @@ TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil."
     (insert "#+STARTUP: overview\n\n")
     (if issues
         (dolist (issue issues)
-          (betterlinear--insert-issue issue))
+          (betterlinear--insert-issue
+           issue
+           nil
+           (betterlinear--planning-for-issue issue planning-map)))
       (insert (or empty-message "No assigned Linear issues found.\n")))
     (betterlinear--set-local-todo-keywords todo-keywords)
     (goto-char (point-min))))
@@ -1036,6 +1187,17 @@ TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil."
    (betterlinear-project-stories betterlinear--project-stories-buffer-project-id)
    betterlinear--project-stories-buffer-title
    "No Linear stories found in this project.\n")
+  t)
+
+(defun betterlinear--revert-team-search-buffer (&rest _args)
+  "Refresh the current BetterLinear team issue search buffer."
+  (unless betterlinear--team-search-buffer-team-id
+    (user-error "No Linear team id associated with this buffer"))
+  (betterlinear--insert-my-issues-org
+   (betterlinear-search-team-issues betterlinear--team-search-buffer-team-id
+                                    betterlinear--team-search-buffer-term)
+   betterlinear--team-search-buffer-title
+   "No Linear issues found for this team search.\n")
   t)
 
 (defun betterlinear--current-issue-id ()
@@ -1078,6 +1240,53 @@ heading for the description before converting it to Markdown."
                        t t)))
     (buffer-string)))
 
+(defun betterlinear--current-org-entry-planning ()
+  "Return the current Org entry planning lines, or nil when there are none.
+
+Planning lines include Org SCHEDULED, DEADLINE, and CLOSED metadata.  They are
+local Org metadata and are intentionally not included in Linear descriptions."
+  (unless (derived-mode-p 'org-mode)
+    (user-error "This command must be run from an Org buffer"))
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+          beg)
+      (forward-line 1)
+      (setq beg (point))
+      (while (and (< (point) subtree-end)
+                  (looking-at-p org-planning-line-re))
+        (forward-line 1))
+      (unless (= beg (point))
+        (buffer-substring-no-properties beg (point))))))
+
+(defun betterlinear--issue-planning-key (issue)
+  "Return the stable key used to preserve local planning for ISSUE."
+  (or (betterlinear--string (alist-get 'id issue))
+      (betterlinear--string (alist-get 'identifier issue))))
+
+(defun betterlinear--org-entry-planning-map ()
+  "Return a hash table mapping Linear issue ids to local Org planning lines."
+  (let ((planning-map (make-hash-table :test #'equal)))
+    (when (derived-mode-p 'org-mode)
+      (save-excursion
+        (save-restriction
+          (widen)
+          (goto-char (point-min))
+          (while (re-search-forward org-heading-regexp nil t)
+            (beginning-of-line)
+            (let ((key (or (org-entry-get (point) "LINEAR_ID")
+                           (org-entry-get (point) "LINEAR_IDENTIFIER")))
+                  (planning (betterlinear--current-org-entry-planning)))
+              (when (and key planning)
+                (puthash key planning planning-map)))
+            (forward-line 1)))))
+    planning-map))
+
+(defun betterlinear--planning-for-issue (issue planning-map)
+  "Return preserved Org planning for ISSUE from PLANNING-MAP."
+  (when-let* ((key (betterlinear--issue-planning-key issue)))
+    (gethash key planning-map)))
+
 (defun betterlinear--current-org-entry-description ()
   "Return the current Org entry body as a Linear Markdown description, or nil.
 
@@ -1115,20 +1324,26 @@ heading levels are normalized relative to the current entry before conversion."
       (org-end-of-subtree t t)
       (list beg (point) level))))
 
-(defun betterlinear--replace-current-entry-with-issue (issue)
-  "Replace the current Org subtree with Linear ISSUE, preserving heading level."
-  (pcase-let ((`(,beg ,end ,level) (betterlinear--current-subtree-region-and-level)))
-    (let ((inhibit-read-only t)
-          (todo-keyword (betterlinear--todo-keyword
-                         (alist-get 'name (alist-get 'state issue))))
-          heading-marker)
-      (delete-region beg end)
-      (goto-char beg)
-      (betterlinear--insert-issue issue level)
-      (setq heading-marker (copy-marker beg t))
-      (betterlinear--ensure-todo-keyword todo-keyword)
-      (goto-char heading-marker)
-      (set-marker heading-marker nil))))
+(defun betterlinear--replace-current-entry-with-issue (issue &optional planning)
+  "Replace the current Org subtree with Linear ISSUE, preserving heading level.
+
+Org planning lines (SCHEDULED, DEADLINE, CLOSED) are local Org metadata, so they
+are preserved on every refresh/replacement but are never sent to Linear as part
+of the description.  When PLANNING is non-nil, use it; otherwise preserve the
+planning lines from the current entry."
+  (let ((planning (or planning (betterlinear--current-org-entry-planning))))
+    (pcase-let ((`(,beg ,end ,level) (betterlinear--current-subtree-region-and-level)))
+      (let ((inhibit-read-only t)
+            (todo-keyword (betterlinear--todo-keyword
+                           (alist-get 'name (alist-get 'state issue))))
+            heading-marker)
+        (delete-region beg end)
+        (goto-char beg)
+        (betterlinear--insert-issue issue level planning)
+        (setq heading-marker (copy-marker beg t))
+        (betterlinear--ensure-todo-keyword todo-keyword)
+        (goto-char heading-marker)
+        (set-marker heading-marker nil)))))
 
 (defun betterlinear--org-entry-insertion-level ()
   "Return a suitable Org heading level for inserting an issue at point."
@@ -1203,6 +1418,91 @@ If the field is unavailable, keep the API order."
                        ((and left-order (not right-order)) t)
                        ((and (not left-order) right-order) nil)
                        (t (< (car left) (car right))))))))))
+
+(defun betterlinear--normalized-search-term (search-term)
+  "Return SEARCH-TERM trimmed, or nil when it is empty."
+  (when-let* ((term (betterlinear--string search-term))
+              (term (string-trim term))
+              (_ (not (string-empty-p term))))
+    term))
+
+(defun betterlinear--team-issues-page (team-id &optional after)
+  "Return one page of TEAM-ID issues after cursor AFTER."
+  (let* ((variables `((teamId . ,team-id)
+                      (first . ,betterlinear-issues-page-size)
+                      (after . ,after)))
+         (data (betterlinear--graphql betterlinear--team-issues-query variables))
+         (team (alist-get 'team data)))
+    (unless team
+      (user-error "Linear team not found: %s" team-id))
+    (let ((connection (alist-get 'issues team)))
+      (list :team team
+            :nodes (alist-get 'nodes connection)
+            :page-info (alist-get 'pageInfo connection)))))
+
+(defun betterlinear--issue-matches-search-term-p (issue search-term)
+  "Return non-nil when ISSUE matches SEARCH-TERM locally."
+  (let ((term (betterlinear--normalized-search-term search-term)))
+    (if (not term)
+        t
+      (let* ((case-fold-search t)
+             (state (alist-get 'state issue))
+             (assignee (alist-get 'assignee issue))
+             (project (alist-get 'project issue))
+             (haystack (string-join
+                        (delq nil
+                              (mapcar (lambda (value)
+                                        (betterlinear--string value))
+                                      (list (alist-get 'id issue)
+                                            (alist-get 'identifier issue)
+                                            (alist-get 'title issue)
+                                            (alist-get 'description issue)
+                                            (alist-get 'url issue)
+                                            (alist-get 'name state)
+                                            (alist-get 'name assignee)
+                                            (alist-get 'name project))))
+                        "\n")))
+        (string-match-p (regexp-quote term) haystack)))))
+
+;;;###autoload
+(defun betterlinear-search-team-issues (team-id search-term)
+  "Return Linear issues in TEAM-ID matching SEARCH-TERM.
+
+Interactively, prompt for a Linear team first, then prompt for a search term.
+An empty search term returns all issues for the selected team.  Searching is
+performed locally over fetched team issues so issue identifiers like ENG-123 are
+supported regardless of Linear GraphQL filter support.  Use
+`betterlinear-search-team-issues-org' to display the results in an Org buffer."
+  (interactive
+   (let* ((teams (betterlinear-teams))
+          (team (progn
+                  (unless teams
+                    (user-error "No Linear teams found"))
+                  (betterlinear--read-team teams)))
+          (team-label (or (betterlinear--string (alist-get 'key team))
+                          (betterlinear--string (alist-get 'name team))
+                          "team"))
+          (term (read-string (format "Search %s issues: " team-label))))
+     (list (alist-get 'id team) term)))
+  (let ((term (betterlinear--normalized-search-term search-term))
+        after issues team has-next)
+    (setq has-next t)
+    (while has-next
+      (let* ((page (betterlinear--team-issues-page team-id after))
+             (page-team (plist-get page :team))
+             (nodes (plist-get page :nodes))
+             (page-info (plist-get page :page-info)))
+        (unless team
+          (setq team page-team))
+        (setq issues (nconc issues nodes))
+        (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+        (setq after (alist-get 'endCursor page-info))))
+    (setq issues (seq-filter (lambda (issue)
+                               (betterlinear--issue-matches-search-term-p issue term))
+                             issues))
+    (when (called-interactively-p 'interactive)
+      (message "Found %d Linear issues" (length issues)))
+    issues))
 
 ;;;###autoload
 (defun betterlinear-project-stories (project-id)
@@ -1300,6 +1600,12 @@ Org buffer."
               (cons (format "%s — %s" key name) team)))
           teams))
 
+(defun betterlinear--read-team (teams)
+  "Prompt for and return a Linear team from TEAMS."
+  (let* ((candidates (betterlinear--team-candidates teams))
+         (choice (completing-read "Linear team: " candidates nil t)))
+    (cdr (assoc choice candidates))))
+
 (defun betterlinear--read-team-id-at-point ()
   "Return a Linear team id for the current Org entry, prompting if needed."
   (save-excursion
@@ -1315,9 +1621,7 @@ Org buffer."
                                                 (alist-get 'key candidate))))
                                     teams))))
           (or (betterlinear--string (alist-get 'id team))
-              (let* ((candidates (betterlinear--team-candidates teams))
-                     (choice (completing-read "Linear team: " candidates nil t)))
-                (alist-get 'id (cdr (assoc choice candidates)))))))))
+              (alist-get 'id (betterlinear--read-team teams)))))))
 
 (defun betterlinear-create-issue (team-id title &optional description)
   "Create a Linear issue in TEAM-ID with TITLE and DESCRIPTION.
@@ -1331,6 +1635,23 @@ Return the created issue."
     (unless (eq (alist-get 'success payload) t)
       (error "Linear failed to create issue"))
     (alist-get 'issue payload)))
+
+(defun betterlinear--issue-with-description (issue description)
+  "Return ISSUE with DESCRIPTION as its Markdown description when non-empty.
+
+Linear creation responses may not immediately echo the supplied description.
+Keeping it on the local issue object ensures replacing the source Org entry does
+not drop the body that was sent to Linear."
+  (if-let* ((description (betterlinear--string description))
+            (description (string-trim description))
+            (_ (not (string-empty-p description))))
+      (let* ((issue (copy-tree issue))
+             (cell (assq 'description issue)))
+        (if cell
+            (setcdr cell description)
+          (push (cons 'description description) issue))
+        issue)
+    issue))
 
 (defun betterlinear-issue (issue-id)
   "Return the latest Linear issue data for ISSUE-ID."
@@ -1547,12 +1868,6 @@ ring."
                  ""
                " (generated)"))))
 
-(defun betterlinear--read-team (teams)
-  "Prompt for and return a Linear team from TEAMS."
-  (let* ((candidates (betterlinear--team-candidates teams))
-         (choice (completing-read "Linear team: " candidates nil t)))
-    (cdr (assoc choice candidates))))
-
 (defun betterlinear--capture-buffer-template (team)
   "Return the initial Org text for a temporary Linear issue capture buffer.
 
@@ -1674,9 +1989,11 @@ keeping the same heading level."
     (when (org-entry-get (point) "LINEAR_ID")
       (user-error "Current Org entry already has a LINEAR_ID property")))
   (let* ((title (betterlinear--current-org-entry-title))
+         (planning (betterlinear--current-org-entry-planning))
          (description (betterlinear--current-org-entry-description))
          (issue (betterlinear-create-issue team-id title description)))
-    (betterlinear--replace-current-entry-with-issue issue)
+    (setq issue (betterlinear--issue-with-description issue description))
+    (betterlinear--replace-current-entry-with-issue issue planning)
     (message "Created Linear issue %s"
              (or (betterlinear--string (alist-get 'identifier issue))
                  (betterlinear--string (alist-get 'id issue))))))
@@ -1739,6 +2056,52 @@ a LINEAR_ID property, as entries generated by `betterlinear-my-issues-org' do."
        (betterlinear-needs-review-pull-requests))
       (setq buffer-read-only t))
     (pop-to-buffer buffer)))
+
+(defun betterlinear--team-display-name (team)
+  "Return a human-readable display name for Linear TEAM."
+  (or (betterlinear--string (alist-get 'key team))
+      (betterlinear--string (alist-get 'name team))
+      (betterlinear--string (alist-get 'id team))
+      "team"))
+
+;;;###autoload
+(defun betterlinear-search-team-issues-org (team search-term)
+  "Search Linear issues for TEAM and show the results in Org.
+
+Interactively, prompt for the Linear team before prompting for SEARCH-TERM.  An
+empty search term shows all issues for the selected team.  TEAM is a Linear team
+alist, as returned by `betterlinear-teams'."
+  (interactive
+   (let* ((teams (betterlinear-teams))
+          (team (progn
+                  (unless teams
+                    (user-error "No Linear teams found"))
+                  (betterlinear--read-team teams)))
+          (term (read-string (format "Search %s issues: "
+                                     (betterlinear--team-display-name team)))))
+     (list team term)))
+  (let* ((team-id (alist-get 'id team))
+         (team-name (betterlinear--team-display-name team))
+         (term (betterlinear--normalized-search-term search-term))
+         (title (if term
+                    (format "Linear %s issues matching %S" team-name term)
+                  (format "Linear %s issues" team-name)))
+         (buffer (get-buffer-create betterlinear-team-search-buffer-name)))
+    (with-current-buffer buffer
+      (betterlinear-org-mode)
+      (setq-local betterlinear--team-search-buffer-team-id team-id)
+      (setq-local betterlinear--team-search-buffer-term term)
+      (setq-local betterlinear--team-search-buffer-title title)
+      (setq-local revert-buffer-function #'betterlinear--revert-team-search-buffer)
+      (betterlinear--insert-my-issues-org
+       (betterlinear-search-team-issues team-id term)
+       title
+       "No Linear issues found for this team search.\n")
+      (setq buffer-read-only t))
+    (pop-to-buffer buffer)))
+
+;;;###autoload
+(defalias 'betterlinear-search-team-tickets-org #'betterlinear-search-team-issues-org)
 
 ;;;###autoload
 (defun betterlinear-project-stories-org (project)
