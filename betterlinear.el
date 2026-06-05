@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026
 
 ;; Author: Endi Sukaj
-;; Version: 0.1.2
+;; Version: 0.1.3
 ;; Package-Requires: ((emacs "27.1") (org "9.0"))
 ;; Keywords: tools, projectmanagement
 ;; URL: https://github.com/Endi1/betterlinear
@@ -217,6 +217,38 @@ not available, BetterLinear falls back to a small built-in converter."
            updatedAt
            readAt
            archivedAt
+           issue {
+             id
+             identifier
+             title
+             attachments(first: 50) {
+               nodes {
+                 id
+                 title
+                 url
+                 createdAt
+                 updatedAt
+               }
+             }
+           }
+         }
+         pageInfo { hasNextPage endCursor }
+       }
+     }")
+    (notifications . "query BetterLinearNeedsReviewPullRequestNotifications($first: Int!, $after: String) {
+       notifications(first: $first, after: $after) {
+         nodes {
+           id
+           type
+           title
+           subtitle
+           url
+           inboxUrl
+           category
+           createdAt
+           updatedAt
+           readAt
+           archivedAt
            ... on PullRequestNotification {
              pullRequest {
                id
@@ -238,13 +270,14 @@ not available, BetterLinear falls back to a small built-in converter."
   "GraphQL queries used to fetch pull requests needing your review.
 
 Each entry is `(KIND . QUERY)'. KIND controls how results are read. The default
-strategy uses Linear notifications and extracts pull requests from
-`PullRequestNotification' nodes.
+strategy uses Linear notifications and extracts review-related pull request
+attachments. It also includes a second query for schemas that expose
+`PullRequestNotification' nodes with first-class pull request data.
 
 Supported KIND values:
 
 - `notifications' expects a top-level `notifications' connection whose nodes may
-  contain `PullRequestNotification' objects.
+  contain issue attachments or `PullRequestNotification' objects.
 - `pull-requests' expects a top-level `pullRequests' connection, for Linear
   schemas that expose that field.
 - `pull-request-reviews' expects a top-level `pullRequestReviews' connection
@@ -650,25 +683,36 @@ This fetches all issues assigned to the authenticated user with
          (variables `((first . ,betterlinear-issues-page-size)
                       (after . ,after)
                       (viewerId . ,viewer-id)))
-         errors)
+         errors
+         empty-page)
     (catch 'page
       (dolist (query-spec betterlinear-needs-review-pull-requests-queries)
         (condition-case err
-            (throw 'page
-                   (append (betterlinear--needs-review-pull-requests-page-with-query
-                            query-spec variables)
-                           (list :viewer viewer)))
+            (let ((page (append (betterlinear--needs-review-pull-requests-page-with-query
+                                 query-spec variables)
+                                (list :viewer viewer))))
+              (if (plist-get page :nodes)
+                  (throw 'page page)
+                (unless empty-page
+                  (setq empty-page page))))
           (error
            (push (error-message-string err) errors))))
-      (error "Could not fetch Linear PRs needing review. Tried %d queries: %s"
-             (length betterlinear-needs-review-pull-requests-queries)
-             (string-join (nreverse errors) " | ")))))
+      (or empty-page
+          (error "Could not fetch Linear PRs needing review. Tried %d queries: %s"
+                 (length betterlinear-needs-review-pull-requests-queries)
+                 (string-join (nreverse errors) " | "))))))
+
+(defun betterlinear--pull-request-merged-p (pull-request)
+  "Return non-nil when PULL-REQUEST has status merged."
+  (string= (downcase (or (betterlinear--string (alist-get 'status pull-request))
+                         ""))
+           "merged"))
 
 (defun betterlinear-needs-review-pull-requests ()
   "Return Linear pull requests that need review from the authenticated user.
 
 This follows Linear pagination until all matching pull requests have been
-retrieved."
+retrieved. Pull requests whose status is `merged' are excluded."
   (let (after pull-requests viewer has-next)
     (setq has-next t)
     (while has-next
@@ -681,7 +725,13 @@ retrieved."
         (setq pull-requests (nconc pull-requests nodes))
         (setq has-next (eq (alist-get 'hasNextPage page-info) t))
         (setq after (alist-get 'endCursor page-info))))
-    pull-requests))
+    (seq-remove #'betterlinear--pull-request-merged-p pull-requests)))
+
+(defun betterlinear-pull-requests-to-review ()
+  "Return Linear pull requests that need your review.
+
+This is a shorter alias for `betterlinear-needs-review-pull-requests'."
+  (betterlinear-needs-review-pull-requests))
 
 (defun betterlinear--string (value)
   "Return VALUE as a string, or nil for nil/JSON null."
@@ -2056,6 +2106,12 @@ a LINEAR_ID property, as entries generated by `betterlinear-my-issues-org' do."
        (betterlinear-needs-review-pull-requests))
       (setq buffer-read-only t))
     (pop-to-buffer buffer)))
+
+;;;###autoload
+(defun betterlinear-list-pull-requests-to-review ()
+  "List Linear pull requests that need your review in an Org buffer."
+  (interactive)
+  (betterlinear-needs-review-pull-requests-org))
 
 (defun betterlinear--team-display-name (team)
   "Return a human-readable display name for Linear TEAM."

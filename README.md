@@ -269,14 +269,17 @@ If Linear returns `branchName`, that value is used. If Linear does not return a 
 ### Show pull requests needing your review
 
 ```elisp
-M-x betterlinear-needs-review-pull-requests-org
+M-x betterlinear-list-pull-requests-to-review
 ```
 
-Fetches Linear pull requests in the “Needs your review” bucket and displays them in an Org buffer.
+Fetches Linear pull requests in the “Needs your review” bucket and displays them in an Org buffer. PRs with `status=merged` are excluded.
+`betterlinear-needs-review-pull-requests-org` is also available as the original command name.
 
 For Lisp callers:
 
 ```elisp
+(betterlinear-pull-requests-to-review)
+;; or
 (betterlinear-needs-review-pull-requests)
 ```
 
@@ -347,6 +350,7 @@ Interactive commands:
 | `betterlinear-copy-git-branch-at-point` | Copy the issue branch name. |
 | `betterlinear-create-issue-from-org-entry` | Create a Linear issue from the current Org entry. |
 | `betterlinear-capture-issue` | Capture a new Linear issue in a temporary Org buffer. |
+| `betterlinear-list-pull-requests-to-review` | Show PRs needing your review in an Org buffer. |
 | `betterlinear-needs-review-pull-requests-org` | Show PRs needing your review in an Org buffer. |
 
 Lower-level functions:
@@ -357,6 +361,7 @@ Lower-level functions:
 | `betterlinear-my-non-done-issues` | Return assigned issues whose workflow state is not done. |
 | `betterlinear-search-team-issues` | Return issues matching a search term for a team. |
 | `betterlinear-project-stories` | Return all stories from a Linear project, ordered by project order. |
+| `betterlinear-pull-requests-to-review` | Return PRs needing your review as Lisp data. |
 | `betterlinear-needs-review-pull-requests` | Return PRs needing your review as Lisp data. |
 | `betterlinear-issue` | Fetch a single issue. |
 | `betterlinear-issue-from-url` | Fetch a single issue from a Linear URL or identifier. |
