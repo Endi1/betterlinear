@@ -8,6 +8,8 @@ An Emacs package for working with [Linear](https://linear.app) issues from Org m
 
 - Fetch all Linear issues assigned to you into an Org-mode buffer.
 - Fetch assigned issues that are not done as Lisp data.
+- Fetch assigned non-done issues in the current cycle as Lisp data or Org.
+- Fetch all issues in the current cycle for a selected team.
 - Search Linear issues for a selected team and show the results in Org.
 - Fetch all Linear stories from a project into an Org-mode buffer or as Lisp data, ordered by the project's Linear sort order.
 - Pull a single Linear issue by URL into the current Org buffer.
@@ -163,6 +165,46 @@ For Lisp callers:
 
 ```elisp
 (betterlinear-my-non-done-issues)
+```
+
+### Show my current-cycle non-done Linear issues
+
+```elisp
+M-x betterlinear-my-current-cycle-non-done-issues-org
+```
+
+This creates or refreshes a buffer named `*Linear My Current Cycle Issues*` containing assigned non-done issues whose Linear cycle is currently active.
+
+For Lisp callers:
+
+```elisp
+(betterlinear-my-current-cycle-non-done-issues)
+```
+
+Alias:
+
+```elisp
+(betterlinear-my-non-done-current-cycle-issues)
+```
+
+### Get current-cycle issues for a team
+
+```elisp
+M-x betterlinear-team-current-cycle-issues
+```
+
+Prompts for a Linear team and opens an Org buffer named `*Linear Team Current Cycle*` containing all issues in the team's active/current Linear cycle. Done/completed issues are included.
+
+You can also call the Org command directly:
+
+```elisp
+M-x betterlinear-team-current-cycle-issues-org
+```
+
+For Lisp callers:
+
+```elisp
+(betterlinear-team-current-cycle-issues "team-id")
 ```
 
 ### Search issues for a team
@@ -338,6 +380,9 @@ Interactive commands:
 | --- | --- |
 | `betterlinear-my-issues-org` | Show assigned Linear issues in an Org buffer. |
 | `betterlinear-my-non-done-issues-org` | Show assigned non-done Linear issues in an Org buffer. |
+| `betterlinear-my-current-cycle-non-done-issues-org` | Show assigned current-cycle non-done Linear issues in an Org buffer. |
+| `betterlinear-team-current-cycle-issues` | Prompt for a team and show its current-cycle issues in an Org buffer. |
+| `betterlinear-team-current-cycle-issues-org` | Show current-cycle issues for a selected team in an Org buffer. |
 | `betterlinear-search-team-issues-org` | Search issues for a selected team and show them in an Org buffer. |
 | `betterlinear-search-team-tickets-org` | Alias for `betterlinear-search-team-issues-org`. |
 | `betterlinear-project-stories-org` | Show all stories from a Linear project in an Org buffer, ordered by project order. |
@@ -359,6 +404,9 @@ Lower-level functions:
 | --- | --- |
 | `betterlinear-my-issues` | Return assigned issues as Lisp data. |
 | `betterlinear-my-non-done-issues` | Return assigned issues whose workflow state is not done. |
+| `betterlinear-my-current-cycle-non-done-issues` | Return assigned current-cycle issues whose workflow state is not done. |
+| `betterlinear-my-non-done-current-cycle-issues` | Alias for `betterlinear-my-current-cycle-non-done-issues`. |
+| `betterlinear-team-current-cycle-issues` | Return all current-cycle issues for a team. |
 | `betterlinear-search-team-issues` | Return issues matching a search term for a team. |
 | `betterlinear-project-stories` | Return all stories from a Linear project, ordered by project order. |
 | `betterlinear-pull-requests-to-review` | Return PRs needing your review as Lisp data. |
@@ -395,6 +443,11 @@ BetterLinear stores Linear metadata in Org properties, including:
 :PROJECT_ID:
 :PROJECT:
 :PROJECT_URL:
+:CYCLE_ID:
+:CYCLE:
+:CYCLE_NUMBER:
+:CYCLE_STARTS_AT:
+:CYCLE_ENDS_AT:
 :PRIORITY:
 :ESTIMATE:
 :DUE:

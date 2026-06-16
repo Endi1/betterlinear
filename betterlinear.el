@@ -55,6 +55,11 @@ variable. Create an API key in Linear under Settings > API."
   :type 'string
   :group 'betterlinear)
 
+(defcustom betterlinear-my-current-cycle-non-done-issues-buffer-name "*Linear My Current Cycle Issues*"
+  "Buffer for `betterlinear-my-current-cycle-non-done-issues-org'."
+  :type 'string
+  :group 'betterlinear)
+
 (defcustom betterlinear-project-stories-buffer-name "*Linear Project Stories*"
   "Name of the Org buffer used by `betterlinear-project-stories-org'."
   :type 'string
@@ -62,6 +67,11 @@ variable. Create an API key in Linear under Settings > API."
 
 (defcustom betterlinear-team-search-buffer-name "*Linear Team Search*"
   "Name of the Org buffer used by `betterlinear-search-team-issues-org'."
+  :type 'string
+  :group 'betterlinear)
+
+(defcustom betterlinear-team-current-cycle-issues-buffer-name "*Linear Team Current Cycle*"
+  "Name of the Org buffer used by `betterlinear-team-current-cycle-issues-org'."
   :type 'string
   :group 'betterlinear)
 
@@ -128,6 +138,12 @@ not available, BetterLinear falls back to a small built-in converter."
 (defvar-local betterlinear--team-search-buffer-title nil
   "Org title used to refresh the current team search buffer.")
 
+(defvar-local betterlinear--team-current-cycle-buffer-team-id nil
+  "Linear team id used to refresh the current team current-cycle buffer.")
+
+(defvar-local betterlinear--team-current-cycle-buffer-title nil
+  "Org title used to refresh the current team current-cycle buffer.")
+
 (defvar betterlinear--my-issues-query
   "query BetterLinearMyIssues($first: Int!, $after: String) {
      viewer {
@@ -152,6 +168,7 @@ not available, BetterLinear falls back to a small built-in converter."
            team { id key name }
            state { id name type }
            project { id name url }
+           cycle { id name number startsAt endsAt }
          }
          pageInfo { hasNextPage endCursor }
        }
@@ -357,8 +374,89 @@ request objects. Customize this if your workspace exposes different fields."
            team { id key name }
            state { id name type }
            project { id name url }
+           cycle { id name number startsAt endsAt }
          }
          pageInfo { hasNextPage endCursor }
+       }
+     }
+   }")
+
+(defvar betterlinear--team-active-cycle-issues-query
+  "query BetterLinearTeamActiveCycleIssues($teamId: String!, $first: Int!, $after: String) {
+     team(id: $teamId) {
+       id
+       key
+       name
+       activeCycle {
+         id
+         name
+         number
+         startsAt
+         endsAt
+         issues(first: $first, after: $after) {
+           nodes {
+             id
+             identifier
+             title
+             description
+             descriptionState
+             url
+             branchName
+             priority
+             priorityLabel
+             estimate
+             createdAt
+             updatedAt
+             dueDate
+             assignee { id name }
+             team { id key name }
+             state { id name type }
+             project { id name url }
+             cycle { id name number startsAt endsAt }
+           }
+           pageInfo { hasNextPage endCursor }
+         }
+       }
+     }
+   }")
+
+(defvar betterlinear--team-current-cycle-issues-query
+  "query BetterLinearTeamCurrentCycleIssues($teamId: String!, $first: Int!, $after: String) {
+     team(id: $teamId) {
+       id
+       key
+       name
+       cycles(first: 1, filter: { isActive: { eq: true } }) {
+         nodes {
+           id
+           name
+           number
+           startsAt
+           endsAt
+           issues(first: $first, after: $after) {
+             nodes {
+               id
+               identifier
+               title
+               description
+               descriptionState
+               url
+               branchName
+               priority
+               priorityLabel
+               estimate
+               createdAt
+               updatedAt
+               dueDate
+               assignee { id name }
+               team { id key name }
+               state { id name type }
+               project { id name url }
+               cycle { id name number startsAt endsAt }
+             }
+             pageInfo { hasNextPage endCursor }
+           }
+         }
        }
      }
    }")
@@ -422,9 +520,20 @@ request objects. Customize this if your workspace exposes different fields."
      }
    }")
 
+(defvar betterlinear--team-states-query
+  "query BetterLinearTeamStates($id: String!) {
+     team(id: $id) {
+       id
+       name
+       states {
+         nodes { id name type }
+       }
+     }
+   }")
+
 (defvar betterlinear--create-issue-mutation
-  "mutation BetterLinearCreateIssue($teamId: String!, $title: String!, $description: String) {
-     issueCreate(input: { teamId: $teamId, title: $title, description: $description }) {
+  "mutation BetterLinearCreateIssue($teamId: String!, $title: String!, $description: String, $stateId: String) {
+     issueCreate(input: { teamId: $teamId, title: $title, description: $description, stateId: $stateId }) {
        success
        issue {
          id
@@ -573,6 +682,46 @@ This fetches all issues assigned to the authenticated user with
 `betterlinear-my-issues', then removes issues whose Linear state type is
 `completed' or whose state name is `Done'."
   (seq-remove #'betterlinear--issue-done-p (betterlinear-my-issues)))
+
+(defun betterlinear--linear-time (value &optional end-of-day)
+  "Return Linear date/time VALUE as an Emacs time value, or nil.
+
+When END-OF-DAY is non-nil and VALUE is a date without a time component, parse
+it as the end of that day."
+  (when-let* ((value (betterlinear--string value)))
+    (when (and end-of-day
+               (string-match-p "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\'" value))
+      (setq value (concat value "T23:59:59Z")))
+    (condition-case nil
+        (date-to-time value)
+      (error nil))))
+
+(defun betterlinear--issue-current-cycle-p (issue &optional now)
+  "Return non-nil when ISSUE belongs to a cycle active at NOW.
+
+NOW defaults to `current-time'.  This uses the issue's `cycle' dates returned by
+Linear and considers the cycle current when NOW is between `startsAt' and
+`endsAt', inclusive."
+  (let* ((cycle (alist-get 'cycle issue))
+         (starts-at (betterlinear--linear-time (alist-get 'startsAt cycle)))
+         (ends-at (betterlinear--linear-time (alist-get 'endsAt cycle) t))
+         (now (or now (current-time))))
+    (and starts-at
+         ends-at
+         (not (time-less-p now starts-at))
+         (not (time-less-p ends-at now)))))
+
+(defun betterlinear-my-current-cycle-non-done-issues ()
+  "Return your assigned non-done Linear issues in the current cycle.
+
+This fetches all issues assigned to the authenticated user, removes issues whose
+Linear workflow state is done/completed, then keeps only issues whose assigned
+cycle is currently active."
+  (seq-filter #'betterlinear--issue-current-cycle-p
+              (betterlinear-my-non-done-issues)))
+
+(defalias 'betterlinear-my-non-done-current-cycle-issues
+  #'betterlinear-my-current-cycle-non-done-issues)
 
 (defun betterlinear--pull-request-url-p (url)
   "Return non-nil when URL looks like a pull/merge request URL."
@@ -813,7 +962,8 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
   (let ((state (alist-get 'state issue))
         (assignee (alist-get 'assignee issue))
         (team (alist-get 'team issue))
-        (project (alist-get 'project issue)))
+        (project (alist-get 'project issue))
+        (cycle (alist-get 'cycle issue)))
     (insert ":PROPERTIES:\n")
     (betterlinear--insert-property "LINEAR_ID" (alist-get 'id issue))
     (betterlinear--insert-property "LINEAR_IDENTIFIER" (alist-get 'identifier issue))
@@ -830,6 +980,11 @@ This is the Linear state name uppercased, with spaces replaced by hyphens."
     (betterlinear--insert-property "PROJECT_ID" (alist-get 'id project))
     (betterlinear--insert-property "PROJECT" (alist-get 'name project))
     (betterlinear--insert-property "PROJECT_URL" (alist-get 'url project))
+    (betterlinear--insert-property "CYCLE_ID" (alist-get 'id cycle))
+    (betterlinear--insert-property "CYCLE" (alist-get 'name cycle))
+    (betterlinear--insert-property "CYCLE_NUMBER" (alist-get 'number cycle))
+    (betterlinear--insert-property "CYCLE_STARTS_AT" (alist-get 'startsAt cycle))
+    (betterlinear--insert-property "CYCLE_ENDS_AT" (alist-get 'endsAt cycle))
     (betterlinear--insert-property "PRIORITY" (alist-get 'priorityLabel issue))
     (betterlinear--insert-property "ESTIMATE" (alist-get 'estimate issue))
     (betterlinear--insert-property "DUE" (alist-get 'dueDate issue))
@@ -1223,6 +1378,14 @@ TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil."
    "No non-done assigned Linear issues found.\n")
   t)
 
+(defun betterlinear--revert-my-current-cycle-non-done-issues-buffer (&rest _args)
+  "Refresh the current BetterLinear current-cycle non-done issues buffer."
+  (betterlinear--insert-my-issues-org
+   (betterlinear-my-current-cycle-non-done-issues)
+   "Linear current-cycle non-done issues assigned to me"
+   "No current-cycle non-done assigned Linear issues found.\n")
+  t)
+
 (defun betterlinear--revert-needs-review-pull-requests-buffer (&rest _args)
   "Refresh the current BetterLinear pull requests buffer."
   (betterlinear--insert-needs-review-pull-requests-org
@@ -1250,6 +1413,17 @@ TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil."
    "No Linear issues found for this team search.\n")
   t)
 
+(defun betterlinear--revert-team-current-cycle-issues-buffer (&rest _args)
+  "Refresh the current BetterLinear team current-cycle issues buffer."
+  (unless betterlinear--team-current-cycle-buffer-team-id
+    (user-error "No Linear team id associated with this buffer"))
+  (betterlinear--insert-my-issues-org
+   (betterlinear-team-current-cycle-issues
+    betterlinear--team-current-cycle-buffer-team-id)
+   betterlinear--team-current-cycle-buffer-title
+   "No Linear issues found for this team's current cycle.\n")
+  t)
+
 (defun betterlinear--current-issue-id ()
   "Return the Linear issue id for the Org entry at point.
 
@@ -1272,6 +1446,14 @@ BetterLinear."
       (if (string-empty-p title)
           (user-error "Current Org entry has an empty heading")
         title))))
+
+(defun betterlinear--current-org-entry-todo-keyword ()
+  "Return the current Org entry TODO keyword, or nil when it has none."
+  (unless (derived-mode-p 'org-mode)
+    (user-error "This command must be run from an Org buffer"))
+  (save-excursion
+    (org-back-to-heading t)
+    (betterlinear--string (org-get-todo-state))))
 
 (defun betterlinear--normalize-org-body-headings (org parent-level)
   "Normalize heading levels in ORG relative to PARENT-LEVEL.
@@ -1554,6 +1736,69 @@ supported regardless of Linear GraphQL filter support.  Use
       (message "Found %d Linear issues" (length issues)))
     issues))
 
+(defun betterlinear--team-current-cycle-issues-page-with-query (query team-id &optional after)
+  "Return one page of current-cycle TEAM-ID issues using QUERY after AFTER."
+  (let* ((variables `((teamId . ,team-id)
+                      (first . ,betterlinear-issues-page-size)
+                      (after . ,after)))
+         (data (betterlinear--graphql query variables))
+         (team (alist-get 'team data)))
+    (unless team
+      (user-error "Linear team not found: %s" team-id))
+    (let* ((cycle (or (alist-get 'activeCycle team)
+                      (car (alist-get 'nodes (alist-get 'cycles team))))))
+      (unless cycle
+        (error "Linear team has no active/current cycle: %s" team-id))
+      (let ((connection (alist-get 'issues cycle)))
+        (list :team team
+              :cycle cycle
+              :nodes (alist-get 'nodes connection)
+              :page-info (alist-get 'pageInfo connection))))))
+
+(defun betterlinear--team-current-cycle-issues-page (team-id &optional after)
+  "Return one page of current-cycle TEAM-ID issues after cursor AFTER.
+
+This asks Linear for the team's active/current cycle directly instead of
+fetching all team issues and guessing the current cycle from dates."
+  (let (errors)
+    (catch 'page
+      (dolist (query (list betterlinear--team-active-cycle-issues-query
+                           betterlinear--team-current-cycle-issues-query))
+        (condition-case err
+            (throw 'page
+                   (betterlinear--team-current-cycle-issues-page-with-query
+                    query team-id after))
+          (error
+           (push (error-message-string err) errors))))
+      (error "Could not fetch Linear current-cycle issues for team %s: %s"
+             team-id
+             (string-join (nreverse errors) " | ")))))
+
+;;;###autoload
+(defun betterlinear-team-current-cycle-issues (team-id)
+  "Return all Linear issues for TEAM-ID in the current cycle.
+
+TEAM-ID is the Linear team id.  This follows pagination through the team's
+active/current Linear cycle.  Done/completed issues are included; use
+`betterlinear--issue-done-p' or `seq-remove' to filter them out if needed."
+  (interactive
+   (let ((teams (betterlinear-teams)))
+     (unless teams
+       (user-error "No Linear teams found"))
+     (list (alist-get 'id (betterlinear--read-team teams)))))
+  (if (called-interactively-p 'interactive)
+      (betterlinear-team-current-cycle-issues-org team-id)
+    (let (after issues has-next)
+      (setq has-next t)
+      (while has-next
+        (let* ((page (betterlinear--team-current-cycle-issues-page team-id after))
+               (nodes (plist-get page :nodes))
+               (page-info (plist-get page :page-info)))
+          (setq issues (nconc issues nodes))
+          (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+          (setq after (alist-get 'endCursor page-info))))
+      issues)))
+
 ;;;###autoload
 (defun betterlinear-project-stories (project-id)
   "Return all Linear stories in PROJECT-ID, ordered as in the project.
@@ -1642,6 +1887,45 @@ Org buffer."
          (teams (alist-get 'teams data)))
     (alist-get 'nodes teams)))
 
+(defun betterlinear--team-with-states (team-id)
+  "Return Linear TEAM-ID including its workflow states."
+  (let* ((data (betterlinear--graphql betterlinear--team-states-query
+                                      `((id . ,team-id))))
+         (team (alist-get 'team data)))
+    (unless team
+      (user-error "Linear team not found: %s" team-id))
+    team))
+
+(defun betterlinear--team-states (team-id)
+  "Return Linear workflow states for TEAM-ID."
+  (let* ((team (betterlinear--team-with-states team-id))
+         (states-connection (alist-get 'states team)))
+    (alist-get 'nodes states-connection)))
+
+(defun betterlinear--state-for-todo-keyword (team-id todo-keyword)
+  "Return TEAM-ID's Linear state matching Org TODO-KEYWORD.
+
+State names are compared using `betterlinear--todo-keyword', so a Linear state
+named \"In Progress\" matches the Org keyword \"IN-PROGRESS\"."
+  (when-let* ((todo-keyword (betterlinear--string todo-keyword))
+              (todo-keyword (string-trim todo-keyword))
+              (_ (not (string-empty-p todo-keyword))))
+    (let* ((normalized-keyword (upcase todo-keyword))
+           (states (betterlinear--team-states team-id))
+           (state (seq-find
+                   (lambda (candidate)
+                     (string= normalized-keyword
+                              (betterlinear--todo-keyword
+                               (alist-get 'name candidate))))
+                   states)))
+      (or state
+          (user-error "No Linear workflow state matching Org TODO keyword %s for team %s"
+                      todo-keyword team-id)))))
+
+(defun betterlinear--state-id-for-todo-keyword (team-id todo-keyword)
+  "Return TEAM-ID's Linear state id matching Org TODO-KEYWORD, or nil."
+  (alist-get 'id (betterlinear--state-for-todo-keyword team-id todo-keyword)))
+
 (defun betterlinear--team-candidates (teams)
   "Return completing-read candidates for Linear TEAMS."
   (mapcar (lambda (team)
@@ -1673,14 +1957,19 @@ Org buffer."
           (or (betterlinear--string (alist-get 'id team))
               (alist-get 'id (betterlinear--read-team teams)))))))
 
-(defun betterlinear-create-issue (team-id title &optional description)
+(defun betterlinear-create-issue (team-id title &optional description state-id)
   "Create a Linear issue in TEAM-ID with TITLE and DESCRIPTION.
 
+When STATE-ID is non-nil, create the issue in that Linear workflow state.
 Return the created issue."
-  (let* ((data (betterlinear--graphql betterlinear--create-issue-mutation
-                                      `((teamId . ,team-id)
-                                        (title . ,title)
-                                        (description . ,description))))
+  (let* ((variables `((teamId . ,team-id)
+                      (title . ,title)
+                      (description . ,description)))
+         (variables (if state-id
+                        (append variables `((stateId . ,state-id)))
+                      variables))
+         (data (betterlinear--graphql betterlinear--create-issue-mutation
+                                      variables))
          (payload (alist-get 'issueCreate data)))
     (unless (eq (alist-get 'success payload) t)
       (error "Linear failed to create issue"))
@@ -1957,25 +2246,29 @@ TEAM is the Linear team selected before starting capture."
   "Create a Linear issue from the temporary capture buffer.
 
 The capture buffer is not saved to any Org file.  The first Org heading is used
-as the Linear title, its body is converted to Markdown for the Linear
-description, and TEAM_ID, LINEAR_TEAM_ID, or TEAM properties select the Linear
-team when present.  If no team property is usable, prompt for a team."
+as the Linear title, its TODO keyword is matched against the team's Linear
+workflow states and used as the new issue state, its body is converted to
+Markdown for the Linear description, and TEAM_ID, LINEAR_TEAM_ID, or TEAM
+properties select the Linear team when present.  If no team property is usable,
+prompt for a team."
   (interactive)
   (unless (derived-mode-p 'betterlinear-capture-mode)
     (user-error "This command must be run from a BetterLinear capture buffer"))
   (let ((buffer (current-buffer))
-        title description team-id issue identifier url)
+        title description team-id todo-keyword state-id issue identifier url)
     (save-excursion
       (betterlinear--goto-capture-heading)
       (when (org-entry-get (point) "LINEAR_ID")
         (user-error "Capture entry already has a LINEAR_ID property"))
       (setq title (betterlinear--current-org-entry-title))
       (setq description (betterlinear--current-org-entry-description))
+      (setq todo-keyword (betterlinear--current-org-entry-todo-keyword))
       (setq team-id (or (org-entry-get (point) "TEAM_ID")
                         (org-entry-get (point) "LINEAR_TEAM_ID")
                         betterlinear--capture-team-id
                         (betterlinear--read-team-id-at-point))))
-    (setq issue (betterlinear-create-issue team-id title description))
+    (setq state-id (betterlinear--state-id-for-todo-keyword team-id todo-keyword))
+    (setq issue (betterlinear-create-issue team-id title description state-id))
     (setq identifier (or (betterlinear--string (alist-get 'identifier issue))
                          (betterlinear--string (alist-get 'id issue))
                          "created issue"))
@@ -2026,10 +2319,12 @@ entry is written."
 (defun betterlinear-create-issue-from-org-entry (team-id)
   "Create a Linear story from the Org entry at point.
 
-The Org heading becomes the Linear title. The entry body, after any planning
-line and property drawer and before the first child heading, becomes the Linear
-description. Interactively, use TEAM_ID/LINEAR_TEAM_ID/TEAM properties when
-present, otherwise prompt for a Linear team.
+The Org heading becomes the Linear title. The entry's TODO keyword is matched
+against the team's Linear workflow states and used as the new issue state. The
+entry body, after any planning line and property drawer and before the first
+child heading, becomes the Linear description. Interactively, use
+TEAM_ID/LINEAR_TEAM_ID/TEAM properties when present, otherwise prompt for a
+Linear team.
 
 After creation, replace the Org entry in place with the created Linear story,
 keeping the same heading level."
@@ -2040,8 +2335,10 @@ keeping the same heading level."
       (user-error "Current Org entry already has a LINEAR_ID property")))
   (let* ((title (betterlinear--current-org-entry-title))
          (planning (betterlinear--current-org-entry-planning))
+         (todo-keyword (betterlinear--current-org-entry-todo-keyword))
          (description (betterlinear--current-org-entry-description))
-         (issue (betterlinear-create-issue team-id title description)))
+         (state-id (betterlinear--state-id-for-todo-keyword team-id todo-keyword))
+         (issue (betterlinear-create-issue team-id title description state-id)))
     (setq issue (betterlinear--issue-with-description issue description))
     (betterlinear--replace-current-entry-with-issue issue planning)
     (message "Created Linear issue %s"
@@ -2121,6 +2418,45 @@ a LINEAR_ID property, as entries generated by `betterlinear-my-issues-org' do."
       "team"))
 
 ;;;###autoload
+(defun betterlinear-team-current-cycle-issues-org (team)
+  "Retrieve current-cycle Linear issues for TEAM and show them in Org.
+
+Interactively, prompt for the Linear team.  TEAM may be a Linear team alist, as
+returned by `betterlinear-teams', or a Linear team id string."
+  (interactive
+   (let ((teams (betterlinear-teams)))
+     (unless teams
+       (user-error "No Linear teams found"))
+     (list (betterlinear--read-team teams))))
+  (let* ((team-id (if (listp team)
+                      (alist-get 'id team)
+                    team))
+         (issues (betterlinear-team-current-cycle-issues team-id))
+         (first-issue (car issues))
+         (issue-team (alist-get 'team first-issue))
+         (cycle (alist-get 'cycle first-issue))
+         (team-name (or (and (listp team) (betterlinear--team-display-name team))
+                        (betterlinear--team-display-name issue-team)
+                        (betterlinear--string team-id)))
+         (cycle-name (betterlinear--string (alist-get 'name cycle)))
+         (title (if cycle-name
+                    (format "Linear %s current cycle %s issues" team-name cycle-name)
+                  (format "Linear %s current cycle issues" team-name)))
+         (buffer (get-buffer-create betterlinear-team-current-cycle-issues-buffer-name)))
+    (with-current-buffer buffer
+      (betterlinear-org-mode)
+      (setq-local betterlinear--team-current-cycle-buffer-team-id team-id)
+      (setq-local betterlinear--team-current-cycle-buffer-title title)
+      (setq-local revert-buffer-function
+                  #'betterlinear--revert-team-current-cycle-issues-buffer)
+      (betterlinear--insert-my-issues-org
+       issues
+       title
+       "No Linear issues found for this team's current cycle.\n")
+      (setq buffer-read-only nil))
+    (pop-to-buffer buffer)))
+
+;;;###autoload
 (defun betterlinear-search-team-issues-org (team search-term)
   "Search Linear issues for TEAM and show the results in Org.
 
@@ -2153,7 +2489,7 @@ alist, as returned by `betterlinear-teams'."
        (betterlinear-search-team-issues team-id term)
        title
        "No Linear issues found for this team search.\n")
-      (setq buffer-read-only t))
+      (setq buffer-read-only nil))
     (pop-to-buffer buffer)))
 
 ;;;###autoload
@@ -2186,7 +2522,24 @@ PROJECT is a Linear project alist, as returned by `betterlinear-projects'."
        (betterlinear-project-stories project-id)
        title
        "No Linear stories found in this project.\n")
-      (setq buffer-read-only t))
+      (setq buffer-read-only nil))
+    (pop-to-buffer buffer)))
+
+;;;###autoload
+(defun betterlinear-my-current-cycle-non-done-issues-org ()
+  "Retrieve your current-cycle non-done Linear issues and show them in Org."
+  (interactive)
+  (let ((buffer (get-buffer-create
+                 betterlinear-my-current-cycle-non-done-issues-buffer-name)))
+    (with-current-buffer buffer
+      (betterlinear-org-mode)
+      (setq-local revert-buffer-function
+                  #'betterlinear--revert-my-current-cycle-non-done-issues-buffer)
+      (betterlinear--insert-my-issues-org
+       (betterlinear-my-current-cycle-non-done-issues)
+       "Linear current-cycle non-done issues assigned to me"
+       "No current-cycle non-done assigned Linear issues found.\n")
+      (setq buffer-read-only nil))
     (pop-to-buffer buffer)))
 
 ;;;###autoload
@@ -2202,7 +2555,7 @@ PROJECT is a Linear project alist, as returned by `betterlinear-projects'."
        (betterlinear-my-non-done-issues)
        "Linear non-done issues assigned to me"
        "No non-done assigned Linear issues found.\n")
-      (setq buffer-read-only t))
+      (setq buffer-read-only nil))
     (pop-to-buffer buffer)))
 
 ;;;###autoload
@@ -2213,7 +2566,7 @@ PROJECT is a Linear project alist, as returned by `betterlinear-projects'."
     (with-current-buffer buffer
       (betterlinear-org-mode)
       (betterlinear--insert-my-issues-org (betterlinear-my-issues))
-      (setq buffer-read-only t))
+      (setq buffer-read-only nil))
     (pop-to-buffer buffer)))
 
 (provide 'betterlinear)
