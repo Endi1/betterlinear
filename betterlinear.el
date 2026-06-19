@@ -85,6 +85,11 @@ variable. Create an API key in Linear under Settings > API."
   :type 'string
   :group 'betterlinear)
 
+(defcustom betterlinear-captured-issue-buffer-name "*Linear Captured Issue*"
+  "Base name of the Org buffer shown after `betterlinear-capture-finalize'."
+  :type 'string
+  :group 'betterlinear)
+
 (defcustom betterlinear-issues-page-size 100
   "Number of issues to request per Linear API page."
   :type 'integer
@@ -2242,6 +2247,32 @@ TEAM is the Linear team selected before starting capture."
         (quit-window t window)
       (kill-buffer buffer))))
 
+(defun betterlinear--show-captured-issue-org (issue)
+  "Open a new Org buffer displaying the freshly created ISSUE.
+
+The buffer is the same `betterlinear-org-mode' Org view used by the other
+listing commands, but it contains the single captured issue."
+  (let* ((identifier (or (betterlinear--string (alist-get 'identifier issue))
+                         (betterlinear--string (alist-get 'id issue))))
+         (buffer (generate-new-buffer betterlinear-captured-issue-buffer-name)))
+    (with-current-buffer buffer
+      (betterlinear-org-mode)
+      (let ((inhibit-read-only t)
+            (todo-keywords (betterlinear--todo-keywords-for-issues (list issue))))
+        (erase-buffer)
+        (insert (format "#+TITLE: Captured Linear issue%s\n"
+                        (if identifier (format " %s" identifier) "")))
+        (insert (format "#+DATE: %s\n"
+                        (format-time-string "%Y-%m-%d %H:%M:%S %Z")))
+        (insert (format "#+TODO: %s\n" (string-join todo-keywords " ")))
+        (insert "#+STARTUP: showeverything\n\n")
+        (betterlinear--insert-issue issue)
+        (betterlinear--set-local-todo-keywords todo-keywords)
+        (goto-char (point-min)))
+      (setq buffer-read-only nil))
+    (pop-to-buffer buffer)
+    buffer))
+
 (defun betterlinear-capture-finalize ()
   "Create a Linear issue from the temporary capture buffer.
 
@@ -2250,7 +2281,10 @@ as the Linear title, its TODO keyword is matched against the team's Linear
 workflow states and used as the new issue state, its body is converted to
 Markdown for the Linear description, and TEAM_ID, LINEAR_TEAM_ID, or TEAM
 properties select the Linear team when present.  If no team property is usable,
-prompt for a team."
+prompt for a team.
+
+After the issue is created the temporary capture buffer is killed and a new
+`betterlinear-org-mode' buffer showing the created issue is opened."
   (interactive)
   (unless (derived-mode-p 'betterlinear-capture-mode)
     (user-error "This command must be run from a BetterLinear capture buffer"))
@@ -2269,11 +2303,13 @@ prompt for a team."
                         (betterlinear--read-team-id-at-point))))
     (setq state-id (betterlinear--state-id-for-todo-keyword team-id todo-keyword))
     (setq issue (betterlinear-create-issue team-id title description state-id))
+    (setq issue (betterlinear--issue-with-description issue description))
     (setq identifier (or (betterlinear--string (alist-get 'identifier issue))
                          (betterlinear--string (alist-get 'id issue))
                          "created issue"))
     (setq url (betterlinear--string (alist-get 'url issue)))
     (betterlinear--kill-capture-buffer buffer)
+    (betterlinear--show-captured-issue-org issue)
     (message "Created Linear issue %s%s"
              identifier
              (if url (format " — %s" url) ""))))
@@ -2295,9 +2331,9 @@ Then edit the heading for the Linear title and add an optional description in
 the body.
 
 Finish with `betterlinear-capture-finalize' (\\[betterlinear-capture-finalize])
-to create the Linear issue and kill the temporary buffer.  Abort with
-`betterlinear-capture-abort' (\\[betterlinear-capture-abort]).  No permanent Org
-entry is written."
+to create the Linear issue, kill the temporary buffer, and open a new Org buffer
+showing the created issue.  Abort with `betterlinear-capture-abort'
+(\\[betterlinear-capture-abort]).  No permanent Org entry is written."
   (interactive
    (let ((teams (betterlinear-teams)))
      (unless teams
