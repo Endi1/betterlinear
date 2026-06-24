@@ -95,6 +95,22 @@ variable. Create an API key in Linear under Settings > API."
   :type 'integer
   :group 'betterlinear)
 
+(defcustom betterlinear-default-team nil
+  "Default Linear team used by team-picking commands.
+
+When non-nil, a string matching either a team key (for example \"AISHBE\")
+or a team id.  Commands that would normally prompt for a team use this team
+instead, without prompting.  Resolution first looks at the teams returned by
+`betterlinear-teams' and, when the team is not in that list, falls back to a
+direct Linear lookup by key or id, so a default still works even when the
+team list is truncated by the Linear API.
+
+Set to nil to always prompt.  With a prefix argument, team-picking commands
+prompt even when this is set."
+  :type '(choice (const :tag "Always prompt" nil)
+                 (string :tag "Team key or id"))
+  :group 'betterlinear)
+
 (defcustom betterlinear-branch-name-format "%i-%t"
   "Fallback git branch format when Linear does not return `branchName'.
 
@@ -521,6 +537,13 @@ request objects. Customize this if your workspace exposes different fields."
 (defvar betterlinear--teams-query
   "query BetterLinearTeams {
      teams {
+       nodes { id key name }
+     }
+   }")
+
+(defvar betterlinear--team-by-key-query
+  "query BetterLinearTeamByKey($key: String!) {
+     teams(filter: { key: { eqIgnoreCase: $key } }, first: 1) {
        nodes { id key name }
      }
    }")
@@ -1939,11 +1962,51 @@ named \"In Progress\" matches the Org keyword \"IN-PROGRESS\"."
               (cons (format "%s — %s" key name) team)))
           teams))
 
+(defun betterlinear--team-by-key (key)
+  "Return the Linear team whose key matches KEY, or nil.
+
+This queries Linear directly, so it works even when KEY's team is not in the
+list returned by `betterlinear-teams'."
+  (when-let* ((key (betterlinear--string key)))
+    (let* ((data (betterlinear--graphql betterlinear--team-by-key-query
+                                        `((key . ,key))))
+           (teams (alist-get 'teams data)))
+      (car (alist-get 'nodes teams)))))
+
+(defun betterlinear--find-team (teams identifier)
+  "Return the team in TEAMS matching IDENTIFIER by id or key, or nil.
+Matching on key is case-insensitive."
+  (when-let* ((identifier (betterlinear--string identifier)))
+    (seq-find (lambda (candidate)
+                (or (string= identifier
+                             (betterlinear--string (alist-get 'id candidate)))
+                    (string= (upcase identifier)
+                             (upcase (or (betterlinear--string
+                                          (alist-get 'key candidate))
+                                         "")))))
+              teams)))
+
+(defun betterlinear--resolve-default-team (teams)
+  "Return the team matching `betterlinear-default-team' from TEAMS, or nil.
+
+When the default is not present in TEAMS (for example because the Linear API
+returned only the first page of teams), fall back to a direct Linear lookup
+by key, then by id."
+  (when-let* ((default (betterlinear--string betterlinear-default-team)))
+    (or (betterlinear--find-team teams default)
+        (betterlinear--team-by-key default)
+        (ignore-errors (betterlinear--team-with-states default)))))
+
 (defun betterlinear--read-team (teams)
-  "Prompt for and return a Linear team from TEAMS."
-  (let* ((candidates (betterlinear--team-candidates teams))
-         (choice (completing-read "Linear team: " candidates nil t)))
-    (cdr (assoc choice candidates))))
+  "Prompt for and return a Linear team from TEAMS.
+
+When `betterlinear-default-team' is set and resolves to a team, return that
+team without prompting, unless a prefix argument is active."
+  (or (and (not current-prefix-arg)
+           (betterlinear--resolve-default-team teams))
+      (let* ((candidates (betterlinear--team-candidates teams))
+             (choice (completing-read "Linear team: " candidates nil t)))
+        (cdr (assoc choice candidates)))))
 
 (defun betterlinear--read-team-id-at-point ()
   "Return a Linear team id for the current Org entry, prompting if needed."
