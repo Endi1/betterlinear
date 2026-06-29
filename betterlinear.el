@@ -75,6 +75,11 @@ variable. Create an API key in Linear under Settings > API."
   :type 'string
   :group 'betterlinear)
 
+(defcustom betterlinear-team-project-issues-buffer-name "*Linear Team Project Issues*"
+  "Name of the Org buffer used by `betterlinear-team-project-issues-org'."
+  :type 'string
+  :group 'betterlinear)
+
 (defcustom betterlinear-needs-review-pull-requests-buffer-name "*Linear Needs Your Review*"
   "Name of the Org buffer used by `betterlinear-needs-review-pull-requests-org'."
   :type 'string
@@ -164,6 +169,15 @@ not available, BetterLinear falls back to a small built-in converter."
 
 (defvar-local betterlinear--team-current-cycle-buffer-title nil
   "Org title used to refresh the current team current-cycle buffer.")
+
+(defvar-local betterlinear--team-project-issues-buffer-team-id nil
+  "Linear team id used to refresh the current team project issues buffer.")
+
+(defvar-local betterlinear--team-project-issues-buffer-project-id nil
+  "Linear project id used to refresh the current team project issues buffer.")
+
+(defvar-local betterlinear--team-project-issues-buffer-title nil
+  "Org title used to refresh the current team project issues buffer.")
 
 (defvar betterlinear--my-issues-query
   "query BetterLinearMyIssues($first: Int!, $after: String) {
@@ -345,6 +359,51 @@ request objects. Customize this if your workspace exposes different fields."
        name
        url
        issues(first: $first, after: $after) {
+         nodes {
+           id
+           identifier
+           title
+           description
+           descriptionState
+           url
+           branchName
+           sortOrder
+           priority
+           priorityLabel
+           estimate
+           createdAt
+           updatedAt
+           dueDate
+           assignee { id name }
+           team { id key name }
+           state { id name type }
+           project { id name url }
+         }
+         pageInfo { hasNextPage endCursor }
+       }
+     }
+   }")
+
+(defvar betterlinear--team-projects-query
+  "query BetterLinearTeamProjects($teamId: String!, $first: Int!, $after: String) {
+     team(id: $teamId) {
+       id
+       key
+       name
+       projects(first: $first, after: $after) {
+         nodes { id name url }
+         pageInfo { hasNextPage endCursor }
+       }
+     }
+   }")
+
+(defvar betterlinear--project-team-issues-query
+  "query BetterLinearProjectTeamIssues($id: String!, $teamId: ID!, $first: Int!, $after: String) {
+     project(id: $id) {
+       id
+       name
+       url
+       issues(first: $first, after: $after, filter: { team: { id: { eq: $teamId } } }) {
          nodes {
            id
            identifier
@@ -1452,6 +1511,19 @@ TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil."
    "No Linear issues found for this team's current cycle.\n")
   t)
 
+(defun betterlinear--revert-team-project-issues-buffer (&rest _args)
+  "Refresh the current BetterLinear team project issues buffer."
+  (unless (and betterlinear--team-project-issues-buffer-team-id
+               betterlinear--team-project-issues-buffer-project-id)
+    (user-error "No Linear team and project associated with this buffer"))
+  (betterlinear--insert-my-issues-org
+   (betterlinear-team-project-issues
+    betterlinear--team-project-issues-buffer-team-id
+    betterlinear--team-project-issues-buffer-project-id)
+   betterlinear--team-project-issues-buffer-title
+   "No Linear issues found in this project for this team.\n")
+  t)
+
 (defun betterlinear--current-issue-id ()
   "Return the Linear issue id for the Org entry at point.
 
@@ -1652,6 +1724,52 @@ planning lines from the current entry."
             :nodes (alist-get 'nodes connection)
             :page-info (alist-get 'pageInfo connection)))))
 
+(defun betterlinear--team-projects-page (team-id &optional after)
+  "Return one page of Linear projects for TEAM-ID after cursor AFTER."
+  (let* ((variables `((teamId . ,team-id)
+                      (first . ,betterlinear-issues-page-size)
+                      (after . ,after)))
+         (data (betterlinear--graphql betterlinear--team-projects-query variables))
+         (team (alist-get 'team data)))
+    (unless team
+      (user-error "Linear team not found: %s" team-id))
+    (let ((connection (alist-get 'projects team)))
+      (list :team team
+            :nodes (alist-get 'nodes connection)
+            :page-info (alist-get 'pageInfo connection)))))
+
+(defun betterlinear-team-projects (team-id)
+  "Return all Linear projects belonging to TEAM-ID.
+
+This follows Linear pagination until all of the team's projects have been
+retrieved.  Each returned project has the same shape as
+`betterlinear-projects' entries."
+  (let (after projects has-next)
+    (setq has-next t)
+    (while has-next
+      (let* ((page (betterlinear--team-projects-page team-id after))
+             (nodes (plist-get page :nodes))
+             (page-info (plist-get page :page-info)))
+        (setq projects (nconc projects nodes))
+        (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+        (setq after (alist-get 'endCursor page-info))))
+    projects))
+
+(defun betterlinear--project-team-issues-page (project-id team-id &optional after)
+  "Return one page of TEAM-ID issues in PROJECT-ID after cursor AFTER."
+  (let* ((variables `((id . ,project-id)
+                      (teamId . ,team-id)
+                      (first . ,betterlinear-issues-page-size)
+                      (after . ,after)))
+         (data (betterlinear--graphql betterlinear--project-team-issues-query variables))
+         (project (alist-get 'project data)))
+    (unless project
+      (user-error "Linear project not found: %s" project-id))
+    (let ((connection (alist-get 'issues project)))
+      (list :project project
+            :nodes (alist-get 'nodes connection)
+            :page-info (alist-get 'pageInfo connection)))))
+
 (defun betterlinear--sort-order (issue)
   "Return ISSUE's Linear sort order as a number, or nil when unavailable."
   (let ((sort-order (alist-get 'sortOrder issue)))
@@ -1667,17 +1785,17 @@ Linear exposes the manual project order on each issue as `sortOrder'. When all
 stories include that field, sort by it while preserving relative order for ties.
 If the field is unavailable, keep the API order."
   (let ((indexed (seq-map-indexed #'cons stories)))
-    (mapcar #'cdr
+    (mapcar #'car
             (sort indexed
                   (lambda (left right)
-                    (let ((left-order (betterlinear--sort-order (cdr left)))
-                          (right-order (betterlinear--sort-order (cdr right))))
+                    (let ((left-order (betterlinear--sort-order (car left)))
+                          (right-order (betterlinear--sort-order (car right))))
                       (cond
                        ((and left-order right-order (/= left-order right-order))
                         (< left-order right-order))
                        ((and left-order (not right-order)) t)
                        ((and (not left-order) right-order) nil)
-                       (t (< (car left) (car right))))))))))
+                       (t (< (cdr left) (cdr right))))))))))
 
 (defun betterlinear--normalized-search-term (search-term)
   "Return SEARCH-TERM trimmed, or nil when it is empty."
@@ -1857,6 +1975,45 @@ Org buffer."
     (when (called-interactively-p 'interactive)
       (message "Retrieved %d Linear project stories" (length stories)))
     stories))
+
+;;;###autoload
+(defun betterlinear-team-project-issues (team-id project-id)
+  "Return all Linear issues in PROJECT-ID belonging to TEAM-ID.
+
+TEAM-ID is the Linear team id and PROJECT-ID is the Linear project id.  This
+follows Linear pagination until all of the project's issues for that team have
+been retrieved, and orders them as in the project.  Each returned issue has the
+same shape as `betterlinear-my-issues' entries.
+
+When called interactively, use `betterlinear-default-team' as the team (a prefix
+argument forces a team prompt), prompt for one of that team's projects by name,
+and display the issues in an Org buffer via
+`betterlinear-team-project-issues-org'."
+  (interactive
+   (let* ((teams (betterlinear-teams))
+          (_ (unless teams
+               (user-error "No Linear teams found")))
+          (team (betterlinear--read-team teams))
+          (resolved-team-id (alist-get 'id team))
+          (projects (betterlinear-team-projects resolved-team-id))
+          (_ (unless projects
+               (user-error "No Linear projects found for team %s"
+                           (betterlinear--team-display-name team)))))
+     (list resolved-team-id
+           (alist-get 'id (betterlinear--read-project projects)))))
+  (if (called-interactively-p 'interactive)
+      (betterlinear-team-project-issues-org team-id project-id)
+    (let (after issues has-next)
+      (setq has-next t)
+      (while has-next
+        (let* ((page (betterlinear--project-team-issues-page
+                      project-id team-id after))
+               (nodes (plist-get page :nodes))
+               (page-info (plist-get page :page-info)))
+          (setq issues (nconc issues nodes))
+          (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+          (setq after (alist-get 'endCursor page-info))))
+      (betterlinear--sort-project-stories issues))))
 
 (defun betterlinear--project-candidates (projects)
   "Return completing-read candidates for Linear PROJECTS."
@@ -2621,6 +2778,51 @@ PROJECT is a Linear project alist, as returned by `betterlinear-projects'."
        (betterlinear-project-stories project-id)
        title
        "No Linear stories found in this project.\n")
+      (setq buffer-read-only nil))
+    (pop-to-buffer buffer)))
+
+;;;###autoload
+(defun betterlinear-team-project-issues-org (team-id project-id)
+  "Retrieve TEAM-ID's Linear issues in PROJECT-ID and show them in Org.
+
+Interactively, use `betterlinear-default-team' as the team (a prefix argument
+forces a team prompt), then prompt for one of that team's projects by name.
+TEAM-ID is the Linear team id and PROJECT-ID is the Linear project id."
+  (interactive
+   (let* ((teams (betterlinear-teams))
+          (_ (unless teams
+               (user-error "No Linear teams found")))
+          (team (betterlinear--read-team teams))
+          (resolved-team-id (alist-get 'id team))
+          (projects (betterlinear-team-projects resolved-team-id))
+          (_ (unless projects
+               (user-error "No Linear projects found for team %s"
+                           (betterlinear--team-display-name team)))))
+     (list resolved-team-id
+           (alist-get 'id (betterlinear--read-project projects)))))
+  (let* ((issues (betterlinear-team-project-issues team-id project-id))
+         (first-issue (car issues))
+         (project (alist-get 'project first-issue))
+         (project-name (or (betterlinear--string (alist-get 'name project))
+                           (betterlinear--string project-id)
+                           "Project"))
+         (team-name (betterlinear--team-display-name
+                     (alist-get 'team first-issue)))
+         (title (if team-name
+                    (format "Linear %s issues in %s" team-name project-name)
+                  (format "Linear issues in %s" project-name)))
+         (buffer (get-buffer-create betterlinear-team-project-issues-buffer-name)))
+    (with-current-buffer buffer
+      (betterlinear-org-mode)
+      (setq-local betterlinear--team-project-issues-buffer-team-id team-id)
+      (setq-local betterlinear--team-project-issues-buffer-project-id project-id)
+      (setq-local betterlinear--team-project-issues-buffer-title title)
+      (setq-local revert-buffer-function
+                  #'betterlinear--revert-team-project-issues-buffer)
+      (betterlinear--insert-my-issues-org
+       issues
+       title
+       "No Linear issues found in this project for this team.\n")
       (setq buffer-read-only nil))
     (pop-to-buffer buffer)))
 
