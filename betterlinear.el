@@ -143,6 +143,22 @@ not available, BetterLinear falls back to a small built-in converter."
   :type 'boolean
   :group 'betterlinear)
 
+(defcustom betterlinear-state-keyword-map nil
+  "Alist mapping Linear state names to Org TODO keywords.
+
+Each entry is a cons cell (STATE-NAME . KEYWORD), where STATE-NAME is the
+exact Linear workflow state name and KEYWORD is the Org TODO keyword to use
+instead of the default (uppercased state name with spaces replaced by hyphens).
+
+Example:
+
+  ((\"Ready\" . \"TODO\")
+   (\"In Review\" . \"REVIEWING\")
+   (\"Blocked\" . \"WAITING\"))"
+  :type '(alist :key-type (string :tag "Linear state name")
+                :value-type (string :tag "Org TODO keyword"))
+  :group 'betterlinear)
+
 (defvar url-http-end-of-headers)
 (defvar url-http-response-status)
 
@@ -988,11 +1004,13 @@ If URL is nil, return DESCRIPTION without link markup."
 (defun betterlinear--todo-keyword (state-name)
   "Return the Org TODO keyword for Linear STATE-NAME.
 
-This is the Linear state name uppercased, with spaces replaced by hyphens."
+Checks `betterlinear-state-keyword-map' first; falls back to uppercasing the
+state name and replacing spaces with hyphens."
   (if-let* ((state-name (betterlinear--string state-name))
             (state-name (string-trim state-name))
             (_ (not (string-empty-p state-name))))
-      (upcase (replace-regexp-in-string "[[:space:]]+" "-" state-name))
+      (or (cdr (assoc state-name betterlinear-state-keyword-map))
+          (upcase (replace-regexp-in-string "[[:space:]]+" "-" state-name)))
     "TODO"))
 
 (defun betterlinear--issue-heading (issue &optional level)
