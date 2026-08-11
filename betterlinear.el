@@ -1013,17 +1013,22 @@ state name and replacing spaces with hyphens."
           (upcase (replace-regexp-in-string "[[:space:]]+" "-" state-name)))
     "TODO"))
 
-(defun betterlinear--issue-heading (issue &optional level)
-  "Return an Org heading line for Linear ISSUE at Org heading LEVEL."
+(defun betterlinear--issue-heading (issue &optional level priority)
+  "Return an Org heading line for Linear ISSUE at Org heading LEVEL.
+
+When PRIORITY is a character (e.g. ?A), include it as an Org priority cookie
+between the TODO keyword and the issue link."
   (let* ((identifier (alist-get 'identifier issue))
          (title (alist-get 'title issue))
          (url (alist-get 'url issue))
          (state (alist-get 'state issue))
          (state-name (alist-get 'name state))
-         (level (or level 1)))
-    (format "%s %s %s %s\n"
+         (level (or level 1))
+         (priority-cookie (when priority (format " [#%c]" priority))))
+    (format "%s %s%s %s %s\n"
             (make-string level ?*)
             (betterlinear--todo-keyword state-name)
+            (or priority-cookie "")
             (betterlinear--org-link url identifier)
             (or (betterlinear--string title) ""))))
 
@@ -1347,13 +1352,14 @@ converted body are shifted below the issue heading at LEVEL."
              (or level 1))
             "\n")))
 
-(defun betterlinear--insert-issue (issue &optional level planning)
+(defun betterlinear--insert-issue (issue &optional level planning priority)
   "Insert Linear ISSUE as an Org entry at heading LEVEL.
 
 When PLANNING is non-nil, insert it as Org planning metadata immediately after
-the heading."
+the heading.  When PRIORITY is a character (e.g. ?A), include it as an Org
+priority cookie in the heading."
   (let ((level (or level 1)))
-    (insert (betterlinear--issue-heading issue level))
+    (insert (betterlinear--issue-heading issue level priority))
     (when (and planning (not (string-empty-p planning)))
       (insert planning)
       (unless (string-suffix-p "\n" planning)
@@ -1454,7 +1460,8 @@ the heading."
 TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil."
   (let ((inhibit-read-only t)
         (todo-keywords (betterlinear--todo-keywords-for-issues issues))
-        (planning-map (betterlinear--org-entry-planning-map)))
+        (planning-map (betterlinear--org-entry-planning-map))
+        (priority-map (betterlinear--org-entry-priority-map)))
     (erase-buffer)
     (insert (format "#+TITLE: %s\n" (or title "Linear issues assigned to me")))
     (insert (format "#+DATE: %s\n" (format-time-string "%Y-%m-%d %H:%M:%S %Z")))
@@ -1465,7 +1472,8 @@ TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil."
           (betterlinear--insert-issue
            issue
            nil
-           (betterlinear--planning-for-issue issue planning-map)))
+           (betterlinear--planning-for-issue issue planning-map)
+           (betterlinear--priority-for-issue issue priority-map)))
       (insert (or empty-message "No assigned Linear issues found.\n")))
     (betterlinear--set-local-todo-keywords todo-keywords)
     (goto-char (point-min))))
@@ -1590,6 +1598,18 @@ heading for the description before converting it to Markdown."
                        t t)))
     (buffer-string)))
 
+(defun betterlinear--current-org-entry-priority ()
+  "Return the current Org entry priority as a character (e.g. ?A), or nil.
+
+Only explicitly-set priority cookies are returned; entries without a [#X]
+cookie return nil."
+  (unless (derived-mode-p 'org-mode)
+    (user-error "This command must be run from an Org buffer"))
+  (save-excursion
+    (org-back-to-heading t)
+    (when (re-search-forward "\\[#\\([A-Z0-9]\\)\\]" (line-end-position) t)
+      (aref (match-string 1) 0))))
+
 (defun betterlinear--current-org-entry-planning ()
   "Return the current Org entry planning lines, or nil when there are none.
 
@@ -1632,10 +1652,36 @@ local Org metadata and are intentionally not included in Linear descriptions."
             (forward-line 1)))))
     planning-map))
 
+(defun betterlinear--org-entry-priority-map ()
+  "Return a hash table mapping Linear issue ids to their Org priority cookies.
+
+Each value is a priority character (e.g. ?A) for entries that have an explicit
+[#X] cookie; entries without a cookie are omitted."
+  (let ((priority-map (make-hash-table :test #'equal)))
+    (when (derived-mode-p 'org-mode)
+      (save-excursion
+        (save-restriction
+          (widen)
+          (goto-char (point-min))
+          (while (re-search-forward org-heading-regexp nil t)
+            (beginning-of-line)
+            (let ((key (or (org-entry-get (point) "LINEAR_ID")
+                           (org-entry-get (point) "LINEAR_IDENTIFIER")))
+                  (priority (betterlinear--current-org-entry-priority)))
+              (when (and key priority)
+                (puthash key priority priority-map)))
+            (forward-line 1)))))
+    priority-map))
+
 (defun betterlinear--planning-for-issue (issue planning-map)
   "Return preserved Org planning for ISSUE from PLANNING-MAP."
   (when-let* ((key (betterlinear--issue-planning-key issue)))
     (gethash key planning-map)))
+
+(defun betterlinear--priority-for-issue (issue priority-map)
+  "Return preserved Org priority character for ISSUE from PRIORITY-MAP, or nil."
+  (when-let* ((key (betterlinear--issue-planning-key issue)))
+    (gethash key priority-map)))
 
 (defun betterlinear--current-org-entry-description ()
   "Return the current Org entry body as a Linear Markdown description, or nil.
@@ -1674,14 +1720,16 @@ heading levels are normalized relative to the current entry before conversion."
       (org-end-of-subtree t t)
       (list beg (point) level))))
 
-(defun betterlinear--replace-current-entry-with-issue (issue &optional planning)
+(defun betterlinear--replace-current-entry-with-issue (issue &optional planning priority)
   "Replace the current Org subtree with Linear ISSUE, preserving heading level.
 
-Org planning lines (SCHEDULED, DEADLINE, CLOSED) are local Org metadata, so they
-are preserved on every refresh/replacement but are never sent to Linear as part
-of the description.  When PLANNING is non-nil, use it; otherwise preserve the
-planning lines from the current entry."
-  (let ((planning (or planning (betterlinear--current-org-entry-planning))))
+Org planning lines (SCHEDULED, DEADLINE, CLOSED) and priority cookies are local
+Org metadata, so they are preserved on every refresh/replacement but are never
+sent to Linear.  When PLANNING is non-nil, use it; otherwise preserve the
+planning lines from the current entry.  When PRIORITY is non-nil, use it as the
+priority character; otherwise preserve the priority cookie from the current entry."
+  (let ((planning (or planning (betterlinear--current-org-entry-planning)))
+        (priority (or priority (betterlinear--current-org-entry-priority))))
     (pcase-let ((`(,beg ,end ,level) (betterlinear--current-subtree-region-and-level)))
       (let ((inhibit-read-only t)
             (todo-keyword (betterlinear--todo-keyword
@@ -1689,7 +1737,7 @@ planning lines from the current entry."
             heading-marker)
         (delete-region beg end)
         (goto-char beg)
-        (betterlinear--insert-issue issue level planning)
+        (betterlinear--insert-issue issue level planning priority)
         (setq heading-marker (copy-marker beg t))
         (betterlinear--ensure-todo-keyword todo-keyword)
         (goto-char heading-marker)
