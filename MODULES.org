@@ -1,0 +1,158 @@
+#+TITLE: Potential BetterLinear Module Split
+#+STARTUP: overview
+
+A sensible split would follow responsibilities rather than the current function order.
+
+* Proposed files
+
+** =betterlinear-core.el=
+
+Shared configuration and HTTP transport:
+
+- The =betterlinear= customization group
+- =betterlinear-api-key=
+- =betterlinear-api-url=
+- =betterlinear-issues-page-size=
+- =betterlinear--api-key=
+- =betterlinear--graphql=
+- Small generic helpers such as =betterlinear--string=
+
+#+begin_src emacs-lisp
+(provide 'betterlinear-core)
+#+end_src
+
+** =betterlinear-data.el=
+
+Pure Linear domain and API operations together with their GraphQL queries:
+
+- Assigned issues and issue lookup
+- Teams, workflow states, and viewer
+- Projects and project stories
+- Team search and current-cycle issues
+- Create and update issue mutations
+- Pagination and project sorting
+
+This module should return Lisp data without creating buffers or invoking Org views.
+
+** =betterlinear-pull-requests.el=
+
+The relatively self-contained pull-request integration:
+
+- =betterlinear-needs-review-pull-requests-queries=
+- Notification parsing
+- Pull-request extraction and deduplication
+- Pagination and merged-status filtering
+- =betterlinear-needs-review-pull-requests=
+
+This depends on =betterlinear-core= and possibly =betterlinear-data= for the viewer.
+
+** =betterlinear-convert.el=
+
+Markdown and Org conversion:
+
+- Pandoc customizations
+- Pandoc invocation
+- Fallback converters
+- Link normalization
+- Description-state text extraction
+- =betterlinear-markdown-to-org=
+- =betterlinear-org-to-markdown=
+
+This functionality is cohesive and independently testable.
+
+** =betterlinear-org.el=
+
+Conversion between Linear issue alists and Org entries:
+
+- =betterlinear-org-mode=
+- TODO keyword handling
+- Issue heading and property insertion
+- Branch-name generation
+- Entry parsing
+- Planning and priority preservation
+- Entry replacement
+- Issue insertion
+
+It should know how to read and render issues, but not fetch them.
+
+** =betterlinear-actions.el=
+
+Commands that mutate Linear or operate at point:
+
+- Set state, project, or assignee
+- Copy branch
+- Insert an issue from a URL
+- Refresh the issue at point
+- Create an issue from an existing Org entry
+- Team, project, and state completion helpers
+
+This depends on =betterlinear-data= and =betterlinear-org=.
+
+** =betterlinear-capture.el=
+
+The temporary capture workflow:
+
+- =betterlinear-capture-mode=
+- Capture keymap and template
+- Finalize and abort
+- Captured-issue display
+- =betterlinear-capture-issue=
+
+This depends on data, Org support, and conversion.
+
+** =betterlinear-views.el=
+
+List buffers and interactive display commands:
+
+- All buffer-name customizations except capture-specific ones
+- Buffer-local refresh context variables
+- =betterlinear--revert-*= functions
+- My-issues views
+- Project, team, current-cycle, and search views
+- Pull-request review view
+
+Buffer creation, =pop-to-buffer=, read-only state, and revert functions belong here.
+
+** =betterlinear.el=
+
+A small compatibility entry point:
+
+#+begin_src emacs-lisp
+(require 'betterlinear-core)
+(require 'betterlinear-data)
+(require 'betterlinear-pull-requests)
+(require 'betterlinear-convert)
+(require 'betterlinear-org)
+(require 'betterlinear-actions)
+(require 'betterlinear-capture)
+(require 'betterlinear-views)
+
+(provide 'betterlinear)
+#+end_src
+
+Existing users could continue using =(require 'betterlinear)=.
+
+* Dependency direction
+
+#+begin_example
+core
+├── data
+├── pull-requests
+├── convert
+│   └── org
+│       ├── actions
+│       ├── capture
+│       └── views
+└────────── views/data/actions
+#+end_example
+
+The important rule is that lower-level modules must not call UI modules.
+
+* Existing coupling to address
+
+Two existing patterns would need care during an eventual split:
+
+1. Data functions such as =betterlinear-team-current-cycle-issues= currently invoke an Org view when called interactively. Ideally, data retrieval and interactive display become separate commands.
+2. =betterlinear-org-mode= currently installs a specific my-issues revert function. The generic mode should probably have no default refresher; each view should install its own =revert-buffer-function=.
+
+This split keeps each file reasonably cohesive without creating a separate tiny module for every GraphQL entity.
