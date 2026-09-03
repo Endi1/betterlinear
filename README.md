@@ -17,6 +17,7 @@ An Emacs package for working with [Linear](https://linear.app) issues from Org m
 - Use Linear workflow state names as Org TODO keywords.
   - Example: `In Progress` becomes `IN-PROGRESS`.
 - Refresh a single Org entry from Linear in place while preserving heading level.
+- Update an existing Linear issue from its Org heading, body, and TODO keyword.
 - Change the Linear state for the issue at point.
 - Set the Linear project for the issue at point.
 - Assign the issue at point to yourself.
@@ -264,6 +265,21 @@ Fetches the latest Linear issue for the current Org entry and replaces the subtr
 
 The heading level is preserved. For example, a `***` entry remains a `***` entry.
 
+### Update a Linear issue from an Org entry
+
+```elisp
+M-x betterlinear-update-issue-from-org-entry
+```
+
+Updates the issue identified by the current entry's `LINEAR_ID` property:
+
+- Org heading → Linear title (the generated identifier link is omitted)
+- Org body → Linear description, converted to Markdown
+- Org TODO keyword → matching Linear workflow state
+
+The entry is replaced with the updated issue while preserving its heading level,
+planning lines, and priority cookie.
+
 ### Change issue state at point
 
 ```elisp
@@ -389,6 +405,7 @@ Interactive commands:
 | `betterlinear-project-stories` | Prompt for a Linear project and fetch its stories as Lisp data, ordered by project order. |
 | `betterlinear-insert-issue-from-url` | Pull a Linear issue by URL and insert it as an Org entry. |
 | `betterlinear-refresh-issue-at-point` | Refresh current Org entry from Linear. |
+| `betterlinear-update-issue-from-org-entry` | Update a Linear issue from the current Org entry. |
 | `betterlinear-set-issue-state-at-point` | Change the Linear workflow state for the issue at point. |
 | `betterlinear-set-project-at-point` | Set the Linear project for the issue at point. |
 | `betterlinear-set-me-as-owner-at-point` | Assign the issue at point to yourself. |
@@ -417,6 +434,7 @@ Lower-level functions:
 | `betterlinear-teams` | Fetch visible teams. |
 | `betterlinear-viewer` | Fetch authenticated Linear user. |
 | `betterlinear-create-issue` | Create an issue. |
+| `betterlinear-update-issue` | Update an issue's title, description, and optionally its state. |
 | `betterlinear-set-issue-state` | Set issue state by state id. |
 | `betterlinear-set-issue-project` | Set issue project by project id. |
 | `betterlinear-set-issue-assignee` | Set issue assignee by user id. |
@@ -462,7 +480,7 @@ Commands that operate on an existing Linear story require `LINEAR_ID` on the cur
 Linear descriptions are Markdown. Org entry bodies are Org. BetterLinear converts between the two:
 
 - Linear → Org when pulling or refreshing issues
-- Org → Markdown when creating issues from Org entries
+- Org → Markdown when creating or updating issues from Org entries
 
 Pandoc is recommended for best results:
 
