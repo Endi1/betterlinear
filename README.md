@@ -224,6 +224,13 @@ For Lisp callers:
 (betterlinear-search-team-issues "team-id" "login")
 ```
 
+The Org command also accepts a team alist or id string, which makes it suitable
+for actions invoked from a Consult buffer:
+
+```elisp
+(betterlinear-search-team-issues-org "team-id" "login")
+```
+
 Alias:
 
 ```elisp

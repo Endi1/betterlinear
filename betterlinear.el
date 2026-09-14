@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026
 
 ;; Author: Endi Sukaj
-;; Version: 0.1.4
+;; Version: 0.1.5
 ;; Package-Requires: ((emacs "27.1") (org "9.0"))
 ;; Keywords: tools, projectmanagement
 ;; URL: https://github.com/Endi1/betterlinear
@@ -2871,8 +2871,9 @@ returned by `betterlinear-teams', or a Linear team id string."
   "Search Linear issues for TEAM and show the results in Org.
 
 Interactively, prompt for the Linear team before prompting for SEARCH-TERM.  An
-empty search term shows all issues for the selected team.  TEAM is a Linear team
-alist, as returned by `betterlinear-teams'."
+empty search term shows all issues for the selected team.  TEAM may be a Linear
+team alist, as returned by `betterlinear-teams', or a team id string.  Accepting
+a string also makes this command usable as an action from a Consult buffer."
   (interactive
    (let* ((teams (betterlinear-teams))
           (team (progn
@@ -2882,8 +2883,21 @@ alist, as returned by `betterlinear-teams'."
           (term (read-string (format "Search %s issues: "
                                      (betterlinear--team-display-name team)))))
      (list team term)))
-  (let* ((team-id (alist-get 'id team))
-         (team-name (betterlinear--team-display-name team))
+  (let* ((team-record (if (listp team)
+                          team
+                        ;; Consult actions commonly pass the displayed
+                        ;; candidate as a string.  Resolve that candidate,
+                        ;; while still allowing callers to pass a team id
+                        ;; directly without an extra API request.
+                        (and (stringp team)
+                             (string-match "\\`\\(.+?\\) — " team)
+                             (ignore-errors
+                               (betterlinear--team-by-key
+                                (match-string 1 team))))))
+         (team-id (or (alist-get 'id team-record) team))
+         (team-name (if team-record
+                        (betterlinear--team-display-name team-record)
+                      (betterlinear--string team)))
          (term (betterlinear--normalized-search-term search-term))
          (title (if term
                     (format "Linear %s issues matching %S" team-name term)
