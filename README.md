@@ -86,7 +86,12 @@ If `betterlinear-api-key` is nil, BetterLinear uses `LINEAR_API_KEY`.
 (setq betterlinear-my-issues-buffer-name "*Linear My Issues*")
 (setq betterlinear-project-stories-buffer-name "*Linear Project Stories*")
 (setq betterlinear-issues-page-size 100)
+(setq betterlinear-project-cache-ttl (* 24 60 60)) ; 24 hours
 ```
+
+Project lists are cached in memory for 24 hours by default. Run
+`M-x betterlinear-clear-project-cache` to force the next project lookup to
+retrieve fresh data, or set the TTL to `0` to disable caching.
 
 Branch name fallback format:
 
@@ -415,6 +420,7 @@ Interactive commands:
 | `betterlinear-update-issue-from-org-entry` | Update a Linear issue from the current Org entry. |
 | `betterlinear-set-issue-state-at-point` | Change the Linear workflow state for the issue at point. |
 | `betterlinear-set-project-at-point` | Set the Linear project for the issue at point. |
+| `betterlinear-clear-project-cache` | Clear cached project lists so the next lookup retrieves fresh data. |
 | `betterlinear-set-me-as-owner-at-point` | Assign the issue at point to yourself. |
 | `betterlinear-copy-git-branch-at-point` | Copy the issue branch name. |
 | `betterlinear-create-issue-from-org-entry` | Create a Linear issue from the current Org entry. |
@@ -437,7 +443,7 @@ Lower-level functions:
 | `betterlinear-needs-review-pull-requests` | Return PRs needing your review as Lisp data. |
 | `betterlinear-issue` | Fetch a single issue. |
 | `betterlinear-issue-from-url` | Fetch a single issue from a Linear URL or identifier. |
-| `betterlinear-projects` | Fetch visible projects. |
+| `betterlinear-projects` | Return visible projects, using the 24-hour cache when available. |
 | `betterlinear-teams` | Fetch visible teams. |
 | `betterlinear-viewer` | Fetch authenticated Linear user. |
 | `betterlinear-create-issue` | Create an issue. |

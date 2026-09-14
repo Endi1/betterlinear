@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026
 
 ;; Author: Endi Sukaj
-;; Version: 0.1.5
+;; Version: 0.1.6
 ;; Package-Requires: ((emacs "27.1") (org "9.0"))
 ;; Keywords: tools, projectmanagement
 ;; URL: https://github.com/Endi1/betterlinear
@@ -100,6 +100,14 @@ variable. Create an API key in Linear under Settings > API."
   :type 'integer
   :group 'betterlinear)
 
+(defcustom betterlinear-project-cache-ttl (* 24 60 60)
+  "Number of seconds to cache lists of Linear projects.
+
+The default is 24 hours.  Set this to 0 to always retrieve projects from
+Linear.  The cache is kept in memory for the current Emacs session."
+  :type 'integer
+  :group 'betterlinear)
+
 (defcustom betterlinear-default-team nil
   "Default Linear team used by team-picking commands.
 
@@ -161,6 +169,9 @@ Example:
 
 (defvar url-http-end-of-headers)
 (defvar url-http-response-status)
+
+(defvar betterlinear--projects-cache (make-hash-table :test #'equal)
+  "Cached Linear project lists, keyed by their query scope.")
 
 (defvar-local betterlinear--project-stories-buffer-project-id nil
   "Linear project id used to refresh the current project stories buffer.")
@@ -1800,18 +1811,50 @@ priority character; otherwise preserve the priority cookie from the current entr
     (list :nodes (alist-get 'nodes connection)
           :page-info (alist-get 'pageInfo connection))))
 
-(defun betterlinear-projects ()
-  "Return all Linear projects visible to the authenticated user."
-  (let (after projects has-next)
-    (setq has-next t)
-    (while has-next
-      (let* ((page (betterlinear--projects-page after))
-             (nodes (plist-get page :nodes))
-             (page-info (plist-get page :page-info)))
-        (setq projects (nconc projects nodes))
-        (setq has-next (eq (alist-get 'hasNextPage page-info) t))
-        (setq after (alist-get 'endCursor page-info))))
-    projects))
+(defun betterlinear--cached-projects (key fetch-function &optional refresh)
+  "Return projects cached under KEY, or call FETCH-FUNCTION.
+
+A cached value is used for `betterlinear-project-cache-ttl' seconds unless
+REFRESH is non-nil.  FETCH-FUNCTION is called with no arguments."
+  (let* ((entry (gethash key betterlinear--projects-cache))
+         (age (and entry (- (float-time) (car entry)))))
+    (if (and (not refresh)
+             age
+             (>= age 0)
+             (< age betterlinear-project-cache-ttl))
+        (cdr entry)
+      (let ((projects (funcall fetch-function)))
+        (puthash key (cons (float-time) projects)
+                 betterlinear--projects-cache)
+        projects))))
+
+;;;###autoload
+(defun betterlinear-clear-project-cache ()
+  "Discard all cached Linear project lists."
+  (interactive)
+  (clrhash betterlinear--projects-cache)
+  (when (called-interactively-p 'interactive)
+    (message "Cleared the Linear project cache")))
+
+(defun betterlinear-projects (&optional refresh)
+  "Return all Linear projects visible to the authenticated user.
+
+Results are cached for `betterlinear-project-cache-ttl' seconds.  When REFRESH
+is non-nil, retrieve the projects from Linear and replace the cached value."
+  (betterlinear--cached-projects
+   'all
+   (lambda ()
+     (let (after projects has-next)
+       (setq has-next t)
+       (while has-next
+         (let* ((page (betterlinear--projects-page after))
+                (nodes (plist-get page :nodes))
+                (page-info (plist-get page :page-info)))
+           (setq projects (nconc projects nodes))
+           (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+           (setq after (alist-get 'endCursor page-info))))
+       projects))
+   refresh))
 
 (defun betterlinear--project-stories-page (project-id &optional after)
   "Return one page of Linear stories in PROJECT-ID after cursor AFTER."
@@ -1841,22 +1884,28 @@ priority character; otherwise preserve the priority cookie from the current entr
             :nodes (alist-get 'nodes connection)
             :page-info (alist-get 'pageInfo connection)))))
 
-(defun betterlinear-team-projects (team-id)
+(defun betterlinear-team-projects (team-id &optional refresh)
   "Return all Linear projects belonging to TEAM-ID.
 
 This follows Linear pagination until all of the team's projects have been
 retrieved.  Each returned project has the same shape as
-`betterlinear-projects' entries."
-  (let (after projects has-next)
-    (setq has-next t)
-    (while has-next
-      (let* ((page (betterlinear--team-projects-page team-id after))
-             (nodes (plist-get page :nodes))
-             (page-info (plist-get page :page-info)))
-        (setq projects (nconc projects nodes))
-        (setq has-next (eq (alist-get 'hasNextPage page-info) t))
-        (setq after (alist-get 'endCursor page-info))))
-    projects))
+`betterlinear-projects' entries.  Results are cached for
+`betterlinear-project-cache-ttl' seconds.  When REFRESH is non-nil, retrieve
+the projects from Linear and replace the team's cached value."
+  (betterlinear--cached-projects
+   (cons 'team team-id)
+   (lambda ()
+     (let (after projects has-next)
+       (setq has-next t)
+       (while has-next
+         (let* ((page (betterlinear--team-projects-page team-id after))
+                (nodes (plist-get page :nodes))
+                (page-info (plist-get page :page-info)))
+           (setq projects (nconc projects nodes))
+           (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+           (setq after (alist-get 'endCursor page-info))))
+       projects))
+   refresh))
 
 (defun betterlinear--project-team-issues-page (project-id team-id &optional after)
   "Return one page of TEAM-ID issues in PROJECT-ID after cursor AFTER."
