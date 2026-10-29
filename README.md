@@ -14,6 +14,7 @@ An Emacs package for working with [Linear](https://linear.app) issues from Org m
 - Fetch all Linear stories from a project into an Org-mode buffer or as Lisp data, ordered by the project's Linear sort order.
 - Pull a single Linear issue by URL into the current Org buffer.
 - Render each Linear issue as an Org heading with a property drawer.
+- Translate Linear priorities into Org priority cookies (`Urgent` → `[#A]`, etc.).
 - Use Linear workflow state names as Org TODO keywords.
   - Example: `In Progress` becomes `IN-PROGRESS`.
 - Refresh a single Org entry from Linear in place while preserving heading level.
@@ -87,6 +88,7 @@ If `betterlinear-api-key` is nil, BetterLinear uses `LINEAR_API_KEY`.
 (setq betterlinear-project-stories-buffer-name "*Linear Project Stories*")
 (setq betterlinear-issues-page-size 100)
 (setq betterlinear-project-cache-ttl (* 24 60 60)) ; 24 hours
+(setq betterlinear-priority-map '((1 . ?A) (2 . ?B) (3 . ?C) (4 . ?D)))
 ```
 
 Project lists are cached in memory for 24 hours by default. Run
@@ -132,7 +134,7 @@ Example output:
 #+TODO: TODO IN-PROGRESS DONE
 #+STARTUP: overview
 
-* IN-PROGRESS [[https://linear.app/acme/issue/ENG-123][ENG-123]] Fix login bug
+* IN-PROGRESS [#C] [[https://linear.app/acme/issue/ENG-123][ENG-123]] Fix login bug
 :PROPERTIES:
 :LINEAR_ID: abc123
 :LINEAR_IDENTIFIER: ENG-123
@@ -149,6 +151,7 @@ Example output:
 :PROJECT_ID: project123
 :PROJECT: Website
 :PROJECT_URL: https://linear.app/acme/project/website
+:LINEAR_PRIORITY: 3
 :PRIORITY: Medium
 :CREATED: 2026-04-01T10:00:00.000Z
 :UPDATED: 2026-04-27T12:00:00.000Z
@@ -158,6 +161,9 @@ Description converted from Linear Markdown into Org.
 ```
 
 The generated buffer uses `betterlinear-org-mode`, derived from `org-mode`. You can refresh it with `revert-buffer`.
+Linear priorities map to Org as `Urgent` → `[#A]`, `High` → `[#B]`,
+`Medium` → `[#C]`, and `Low` → `[#D]`. Unprioritized issues have no cookie;
+customize `betterlinear-priority-map` to use a different mapping.
 
 ### Show my assigned non-done Linear issues
 
@@ -362,7 +368,7 @@ M-x betterlinear-create-issue-from-org-entry
 The current Org entry becomes a Linear story:
 
 - Org heading → Linear title
-- Org body → Linear description, converted to Markdown
+- Org body → Linear description, converted to Markdown (all drawers, including those in child headings, are omitted)
 - `TEAM_ID`, `LINEAR_TEAM_ID`, or `TEAM` property → Linear team, when present
 - Otherwise, BetterLinear prompts for a team
 

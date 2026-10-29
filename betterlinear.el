@@ -20,6 +20,7 @@
 
 (require 'json)
 (require 'org)
+(require 'org-element)
 (require 'seq)
 (require 'subr-x)
 (require 'thingatpt)
@@ -165,6 +166,20 @@ Example:
    (\"Blocked\" . \"WAITING\"))"
   :type '(alist :key-type (string :tag "Linear state name")
                 :value-type (string :tag "Org TODO keyword"))
+  :group 'betterlinear)
+
+(defcustom betterlinear-priority-map
+  '((1 . ?A)
+    (2 . ?B)
+    (3 . ?C)
+    (4 . ?D))
+  "Alist mapping Linear priority numbers to Org priority characters.
+
+Linear priorities are 1 (urgent), 2 (high), 3 (medium), 4 (low), and 0 (no
+priority).  An issue with no priority gets no Org priority cookie.  Customize
+this map if your Org configuration uses a different priority range."
+  :type '(alist :key-type (integer :tag "Linear priority")
+                :value-type (character :tag "Org priority"))
   :group 'betterlinear)
 
 (defvar url-http-end-of-headers)
@@ -756,25 +771,29 @@ an issue in Linear, or `betterlinear-capture-abort'
         (with-current-buffer buffer
           (unless (and (boundp 'url-http-response-status) url-http-response-status)
             (error "No HTTP response from Linear API"))
-          (unless (<= 200 url-http-response-status 299)
-            (let ((body (buffer-substring-no-properties
-                         (or url-http-end-of-headers (point-min))
-                         (point-max))))
-              (error "Linear API HTTP %s: %s" url-http-response-status (string-trim body))))
-          (goto-char (or url-http-end-of-headers (point-min)))
-          (let* ((json-object-type 'alist)
-                 (json-array-type 'list)
-                 (json-key-type 'symbol)
-                 (response (json-read))
-                 (errors (alist-get 'errors response))
-                 (data (alist-get 'data response)))
-            (when errors
-              (error "Linear API error: %s"
-                     (mapconcat (lambda (err)
-                                  (or (alist-get 'message err) (format "%S" err)))
-                                errors
-                                "; ")))
-            data))
+          (let* ((body-start (or url-http-end-of-headers (point-min)))
+                 ;; URL retrieval buffers are unibyte.  Decode a copy of the
+                 ;; raw response rather than decoding in place: an unibyte
+                 ;; buffer cannot retain the resulting Unicode characters.
+                 (raw-body (buffer-substring-no-properties body-start (point-max)))
+                 (body (decode-coding-string raw-body 'utf-8)))
+            (unless (<= 200 url-http-response-status 299)
+              (error "Linear API HTTP %s: %s"
+                     url-http-response-status
+                     (string-trim body)))
+            (let* ((json-object-type 'alist)
+                   (json-array-type 'list)
+                   (json-key-type 'symbol)
+                   (response (json-read-from-string body))
+                   (errors (alist-get 'errors response))
+                   (data (alist-get 'data response)))
+              (when errors
+                (error "Linear API error: %s"
+                       (mapconcat (lambda (err)
+                                    (or (alist-get 'message err) (format "%S" err)))
+                                  errors
+                                  "; ")))
+              data)))
       (kill-buffer buffer))))
 
 (defun betterlinear--assigned-issues-page (&optional after)
@@ -1051,17 +1070,35 @@ state name and replacing spaces with hyphens."
           (upcase (replace-regexp-in-string "[[:space:]]+" "-" state-name)))
     "TODO"))
 
+(defun betterlinear--issue-org-priority (issue)
+  "Return the Org priority character corresponding to Linear ISSUE.
+
+Return nil when ISSUE has no Linear priority or its priority is not present in
+`betterlinear-priority-map'."
+  (let* ((value (alist-get 'priority issue))
+         (priority (cond
+                    ((integerp value) value)
+                    ((and (stringp value)
+                          (string-match-p "\\`[0-9]+\\'" value))
+                     (string-to-number value)))))
+    (cdr (assq priority betterlinear-priority-map))))
+
 (defun betterlinear--issue-heading (issue &optional level priority)
   "Return an Org heading line for Linear ISSUE at Org heading LEVEL.
 
-When PRIORITY is a character (e.g. ?A), include it as an Org priority cookie
-between the TODO keyword and the issue link."
+ISSUE's Linear priority is translated with `betterlinear-priority-map'.  When
+the response does not contain a `priority' field, PRIORITY is used as a
+fallback.  A priority character (e.g. ?A) is rendered between the TODO keyword
+and the issue link."
   (let* ((identifier (alist-get 'identifier issue))
          (title (alist-get 'title issue))
          (url (alist-get 'url issue))
          (state (alist-get 'state issue))
          (state-name (alist-get 'name state))
          (level (or level 1))
+         (priority (if (assq 'priority issue)
+                       (betterlinear--issue-org-priority issue)
+                     priority))
          (priority-cookie (when priority (format " [#%c]" priority))))
     (format "%s %s%s %s %s\n"
             (make-string level ?*)
@@ -1133,6 +1170,7 @@ between the TODO keyword and the issue link."
     (betterlinear--insert-property "CYCLE_NUMBER" (alist-get 'number cycle))
     (betterlinear--insert-property "CYCLE_STARTS_AT" (alist-get 'startsAt cycle))
     (betterlinear--insert-property "CYCLE_ENDS_AT" (alist-get 'endsAt cycle))
+    (betterlinear--insert-property "LINEAR_PRIORITY" (alist-get 'priority issue))
     (betterlinear--insert-property "PRIORITY" (alist-get 'priorityLabel issue))
     (betterlinear--insert-property "ESTIMATE" (alist-get 'estimate issue))
     (betterlinear--insert-property "DUE" (alist-get 'dueDate issue))
@@ -1394,8 +1432,8 @@ converted body are shifted below the issue heading at LEVEL."
   "Insert Linear ISSUE as an Org entry at heading LEVEL.
 
 When PLANNING is non-nil, insert it as Org planning metadata immediately after
-the heading.  When PRIORITY is a character (e.g. ?A), include it as an Org
-priority cookie in the heading."
+the heading.  ISSUE's Linear priority is translated to an Org priority cookie.
+PRIORITY is used only when the response has no `priority' field."
   (let ((level (or level 1)))
     (insert (betterlinear--issue-heading issue level priority))
     (when (and planning (not (string-empty-p planning)))
@@ -1731,12 +1769,30 @@ Each value is a priority character (e.g. ?A) for entries that have an explicit
   (when-let* ((key (betterlinear--issue-planning-key issue)))
     (gethash key priority-map)))
 
+(defun betterlinear--org-body-without-drawers (org)
+  "Return ORG with all drawers removed, including those in child entries."
+  (with-temp-buffer
+    (insert org)
+    (delay-mode-hooks (org-mode))
+    (let ((tree (org-element-parse-buffer))
+          regions)
+      (org-element-map tree '(drawer property-drawer)
+        (lambda (drawer)
+          (push (cons (org-element-property :begin drawer)
+                      (org-element-property :end drawer))
+                regions)))
+      ;; Delete backwards so the parsed positions remain valid.
+      (dolist (region regions)
+        (delete-region (car region) (cdr region))))
+    (buffer-string)))
+
 (defun betterlinear--current-org-entry-description ()
   "Return the current Org entry body as a Linear Markdown description, or nil.
 
 The description starts after the entry heading, planning line, and property
-drawer, includes child subtrees, and is converted from Org to Markdown. Child
-heading levels are normalized relative to the current entry before conversion."
+drawer, includes child subtrees, and is converted from Org to Markdown. All
+drawers, including those in child subtrees, are excluded. Child heading levels
+are normalized relative to the current entry before conversion."
   (unless (derived-mode-p 'org-mode)
     (user-error "This command must be run from an Org buffer"))
   (save-excursion
@@ -1754,7 +1810,10 @@ heading levels are normalized relative to the current entry before conversion."
             (forward-line 1)
           (user-error "Malformed property drawer in current Org entry")))
       (setq beg (point))
-      (setq description (string-trim (buffer-substring-no-properties beg subtree-end)))
+      (setq description
+            (string-trim
+             (betterlinear--org-body-without-drawers
+              (buffer-substring-no-properties beg subtree-end))))
       (unless (string-empty-p description)
         (betterlinear-org-to-markdown
          (betterlinear--normalize-org-body-headings description parent-level))))))
@@ -1771,11 +1830,12 @@ heading levels are normalized relative to the current entry before conversion."
 (defun betterlinear--replace-current-entry-with-issue (issue &optional planning priority)
   "Replace the current Org subtree with Linear ISSUE, preserving heading level.
 
-Org planning lines (SCHEDULED, DEADLINE, CLOSED) and priority cookies are local
-Org metadata, so they are preserved on every refresh/replacement but are never
-sent to Linear.  When PLANNING is non-nil, use it; otherwise preserve the
-planning lines from the current entry.  When PRIORITY is non-nil, use it as the
-priority character; otherwise preserve the priority cookie from the current entry."
+Org planning lines (SCHEDULED, DEADLINE, CLOSED) are local metadata and are
+preserved on every refresh/replacement but are never sent to Linear.  When
+PLANNING is non-nil, use it; otherwise preserve the planning lines from the
+current entry.  ISSUE's Linear priority takes precedence over PRIORITY and the
+current entry's priority cookie.  A local cookie is preserved only when the
+response does not contain a `priority' field."
   (let ((planning (or planning (betterlinear--current-org-entry-planning)))
         (priority (or priority (betterlinear--current-org-entry-priority))))
     (pcase-let ((`(,beg ,end ,level) (betterlinear--current-subtree-region-and-level)))
@@ -2778,8 +2838,8 @@ keeping the same heading level."
 The current entry must have a LINEAR_ID property.  Its heading becomes the
 Linear title, its body is converted to Markdown for the description, and its
 TODO keyword is matched to a workflow state for the issue's team.  Org planning
-lines and priority cookies remain local and are preserved when the entry is
-replaced with the response from Linear."
+lines remain local.  The refreshed entry uses Linear's translated priority;
+an unprioritized Linear issue has no Org priority cookie."
   (interactive)
   (let* ((issue-id (betterlinear--current-issue-id))
          (title (betterlinear--current-org-entry-title))
