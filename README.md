@@ -161,6 +161,7 @@ Description converted from Linear Markdown into Org.
 ```
 
 The generated buffer uses `betterlinear-org-mode`, derived from `org-mode`. You can refresh it with `revert-buffer`.
+When a parent and its sub-issues are both in the results, children are nested beneath the parent. Children whose parents are outside the view remain root entries with parent metadata; list filters are not expanded automatically.
 Linear priorities map to Org as `Urgent` → `[#A]`, `High` → `[#B]`,
 `Medium` → `[#C]`, and `Low` → `[#D]`. Unprioritized issues have no cookie;
 customize `betterlinear-priority-map` to use a different mapping.
@@ -281,7 +282,7 @@ M-x betterlinear-refresh-issue-at-point
 
 Fetches the latest Linear issue for the current Org entry and replaces the subtree in place.
 
-The heading level is preserved. For example, a `***` entry remains a `***` entry.
+The heading level is preserved. For example, a `***` entry remains a `***` entry. Existing sub-issues and local TODO drafts are preserved, but are not fetched recursively; use `betterlinear-fetch-sub-issues` for that.
 
 ### Refresh all Linear entries in an Org file
 
@@ -290,6 +291,61 @@ M-x betterlinear-refresh-all-issues
 ```
 
 Refreshes every entry with its own `LINEAR_ID` in the current buffer, even when narrowed. Preserves heading levels, local planning lines, and nested Linear entries. Content outside refreshed entries is unchanged. Local edits to Linear-backed content are overwritten; the file is not saved automatically. All issues are fetched before any entries are changed, so a fetch failure leaves the buffer untouched.
+
+### Work with sub-issues
+
+Sub-issues are nested Org headings. A heading with its own `LINEAR_ID` is an existing issue, regardless of its TODO keyword. A nested heading with any configured Org TODO keyword (including done keywords) and no `LINEAR_ID` is a **local sub-issue draft**. Ordinary headings without a TODO keyword remain part of the description.
+
+```org
+* TODO Parent issue
+:PROPERTIES:
+:LINEAR_ID: parent-uuid
+:TEAM_ID: team-uuid
+:END:
+
+Parent description.
+
+** Implementation notes
+These notes belong to the parent's description.
+
+** TODO Child draft
+This will become the child's description, not the parent's.
+
+*** TODO Grandchild draft
+Create the child before creating this draft.
+```
+
+To display existing sub-issues, run this on a Linear-backed parent:
+
+```elisp
+M-x betterlinear-fetch-sub-issues
+```
+
+This explicitly fetches the complete descendant tree, including every page, regardless of the current view's filters. Existing issues anywhere in the buffer are refreshed in place rather than duplicated or moved; missing children are inserted under their parents. Local drafts and planning lines are preserved. No local children are deleted when absent from the response. All fetching finishes before edits begin.
+
+To create a sub-issue:
+
+1. Add a nested TODO heading yourself, or run `M-x betterlinear-add-sub-issue` on an existing Linear issue.
+2. Edit the draft's title and body.
+3. Run `M-x betterlinear-create-sub-issue-from-org-entry` on the draft.
+
+Generated list buffers are read-only; use `C-x C-q` before adding or editing drafts. The draft's nearest enclosing issue supplies the Linear parent and default team. Explicit `TEAM_ID`, `LINEAR_TEAM_ID`, or `TEAM` properties on the draft override the team. Its TODO keyword must match a Linear workflow state, directly or through `betterlinear-state-keyword-map`, as with normal issue creation.
+
+Alternatively, capture a child in a temporary buffer by selecting its parent from your Org agenda files:
+
+```elisp
+M-x betterlinear-capture-sub-issue
+```
+
+Run this from any buffer. It prompts for a parent among entries with their own `LINEAR_ID` in `org-agenda-files`, displaying the identifier, title, file, and line. Unsaved edits in already-open agenda files are included. Ordinary headings and uncreated drafts are not candidates.
+
+Edit the title and description, then use `C-c C-c` to create the child and insert its Org entry beneath the selected parent. The parent's team is selected automatically; you can override the team properties in the capture. `C-c C-k` cancels without changing the source. This also works with read-only agenda file buffers. Finalization returns to the new entry and does not save the source file.
+
+Failures keep the capture buffer open. If Linear creation succeeded but local insertion failed, retrying `C-c C-c` inserts the already-created issue rather than creating another one; edits made after that creation are not sent again. Aborting in that situation does not delete the issue from Linear.
+
+Creation affects **only the selected draft** and preserves its nested drafts. Create parents before their children. There is no recursive/bulk creation yet. Refreshing never creates issues, and moving headings never reparents existing issues in Linear. Parent updates exclude all sub-issue subtrees from the description.
+
+`revert-buffer` on generated issue views preserves drafts under issues still in the results, adjusting their heading levels if needed. If a draft's owner disappears from the results, refresh is refused rather than discarding the draft. Create or move those drafts first.
 
 ### Update a Linear issue from an Org entry
 
@@ -300,7 +356,7 @@ M-x betterlinear-update-issue-from-org-entry
 Updates the issue identified by the current entry's `LINEAR_ID` property:
 
 - Org heading → Linear title (the generated identifier link is omitted)
-- Org body → Linear description, converted to Markdown
+- Org body and ordinary child headings → Linear description, converted to Markdown; sub-issue subtrees are excluded
 - Org TODO keyword → matching Linear workflow state
 
 The entry is replaced with the updated issue while preserving its heading level,
@@ -380,7 +436,7 @@ The current Org entry becomes a Linear story:
 - `TEAM_ID`, `LINEAR_TEAM_ID`, or `TEAM` property → Linear team, when present
 - Otherwise, BetterLinear prompts for a team
 
-After creation, the Org entry is replaced in place with the created Linear issue and keeps the same heading level.
+After creation, the Org entry is replaced in place with the created Linear issue and keeps the same heading level. Nested TODO headings are preserved as local sub-issue drafts, not included in the description or created automatically. For drafts under an existing Linear issue, use `betterlinear-create-sub-issue-from-org-entry` instead.
 
 Example source Org entry:
 
@@ -432,6 +488,9 @@ Interactive commands:
 | `betterlinear-insert-issue-from-url` | Pull a Linear issue by URL and insert it as an Org entry. |
 | `betterlinear-refresh-issue-at-point` | Refresh current Org entry from Linear. |
 | `betterlinear-refresh-all-issues` | Refresh all Linear entries in the current Org buffer. |
+| `betterlinear-fetch-sub-issues` | Fetch and display an issue's complete descendant tree. |
+| `betterlinear-add-sub-issue` | Insert a local TODO sub-issue draft under the current issue. |
+| `betterlinear-create-sub-issue-from-org-entry` | Create the current draft under its enclosing Linear issue. |
 | `betterlinear-update-issue-from-org-entry` | Update a Linear issue from the current Org entry. |
 | `betterlinear-set-issue-state-at-point` | Change the Linear workflow state for the issue at point. |
 | `betterlinear-set-project-at-point` | Set the Linear project for the issue at point. |
@@ -440,6 +499,7 @@ Interactive commands:
 | `betterlinear-copy-git-branch-at-point` | Copy the issue branch name. |
 | `betterlinear-create-issue-from-org-entry` | Create a Linear issue from the current Org entry. |
 | `betterlinear-capture-issue` | Capture a new Linear issue in a temporary Org buffer. |
+| `betterlinear-capture-sub-issue` | Select a parent from agenda files, capture a child, and insert it beneath that parent. |
 | `betterlinear-list-pull-requests-to-review` | Show PRs needing your review in an Org buffer. |
 | `betterlinear-needs-review-pull-requests-org` | Show PRs needing your review in an Org buffer. |
 
@@ -461,7 +521,8 @@ Lower-level functions:
 | `betterlinear-projects` | Return visible projects, using the 24-hour cache when available. |
 | `betterlinear-teams` | Fetch visible teams. |
 | `betterlinear-viewer` | Fetch authenticated Linear user. |
-| `betterlinear-create-issue` | Create an issue. |
+| `betterlinear-create-issue` | Create an issue; optional fifth argument selects its parent. |
+| `betterlinear-sub-issues` | Fetch all descendants of an issue as flat Lisp data. |
 | `betterlinear-update-issue` | Update an issue's title, description, and optionally its state. |
 | `betterlinear-set-issue-state` | Set issue state by state id. |
 | `betterlinear-set-issue-project` | Set issue project by project id. |
@@ -478,6 +539,9 @@ BetterLinear stores Linear metadata in Org properties, including:
 :LINEAR_IDENTIFIER:
 :LINEAR_URL:
 :LINEAR_BRANCH:
+:LINEAR_PARENT_ID:
+:LINEAR_PARENT_IDENTIFIER:
+:LINEAR_PARENT_URL:
 :STATE_ID:
 :STATE:
 :STATE_TYPE:
@@ -531,6 +595,14 @@ Byte-compile check:
 ```sh
 emacs -Q --batch -f batch-byte-compile betterlinear.el
 rm -f betterlinear.elc
+```
+
+Run the tests:
+
+```sh
+emacs -Q --batch -L . \
+  $(find tests -name '*-test.el' -exec printf ' -l %s' {} \;) \
+  -f ert-run-tests-batch-and-exit
 ```
 
 ## License
