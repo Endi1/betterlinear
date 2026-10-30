@@ -283,6 +283,14 @@ Fetches the latest Linear issue for the current Org entry and replaces the subtr
 
 The heading level is preserved. For example, a `***` entry remains a `***` entry.
 
+### Refresh all Linear entries in an Org file
+
+```elisp
+M-x betterlinear-refresh-all-issues
+```
+
+Refreshes every entry with its own `LINEAR_ID` in the current buffer, even when narrowed. Preserves heading levels, local planning lines, and nested Linear entries. Content outside refreshed entries is unchanged. Local edits to Linear-backed content are overwritten; the file is not saved automatically. All issues are fetched before any entries are changed, so a fetch failure leaves the buffer untouched.
+
 ### Update a Linear issue from an Org entry
 
 ```elisp
@@ -423,6 +431,7 @@ Interactive commands:
 | `betterlinear-project-stories` | Prompt for a Linear project and fetch its stories as Lisp data, ordered by project order. |
 | `betterlinear-insert-issue-from-url` | Pull a Linear issue by URL and insert it as an Org entry. |
 | `betterlinear-refresh-issue-at-point` | Refresh current Org entry from Linear. |
+| `betterlinear-refresh-all-issues` | Refresh all Linear entries in the current Org buffer. |
 | `betterlinear-update-issue-from-org-entry` | Update a Linear issue from the current Org entry. |
 | `betterlinear-set-issue-state-at-point` | Change the Linear workflow state for the issue at point. |
 | `betterlinear-set-project-at-point` | Set the Linear project for the issue at point. |
