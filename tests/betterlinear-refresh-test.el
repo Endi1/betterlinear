@@ -34,7 +34,7 @@
 (ert-deftest betterlinear-refresh-all-issues-nested ()
   (with-temp-buffer
     (org-mode)
-    (insert "* Parent\n:PROPERTIES:\n:LINEAR_ID: 1\n:END:\n** Child\n:PROPERTIES:\n:LINEAR_ID: 2\n:END:\n** Local child\nKeep\n")
+    (insert "* Parent\n:PROPERTIES:\n:LINEAR_ID: 1\n:END:\n** Child\n:PROPERTIES:\n:LINEAR_ID: 2\n:END:\n** TODO Local child\nKeep\n")
     (let ((org-use-property-inheritance t) fetched)
       (cl-letf (((symbol-function 'betterlinear-issue)
                  (lambda (id)
@@ -44,7 +44,7 @@
     (goto-char (point-min))
     (should (re-search-forward "^\\* .*Remote 1" nil t))
     (should (re-search-forward "^\\*\\* .*Remote 2" nil t))
-    (should (search-forward "** Local child\nKeep" nil t))))
+    (should (search-forward "** TODO Local child\nKeep" nil t))))
 
 (ert-deftest betterlinear-refresh-all-issues-fetch-failure-is-nondestructive ()
   (with-temp-buffer

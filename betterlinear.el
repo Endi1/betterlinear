@@ -18,6 +18,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'json)
 (require 'org)
 (require 'org-element)
@@ -197,6 +198,16 @@ this map if your Org configuration uses a different priority range."
 (defvar-local betterlinear--capture-team-id nil
   "Linear team id selected for the current temporary capture buffer.")
 
+(defvar-local betterlinear--capture-parent-issue nil
+  "Parent issue metadata for a sub-issue capture, or nil for normal capture.")
+
+(defvar-local betterlinear--capture-parent-marker nil
+  "Marker at the source Org parent of a sub-issue capture.")
+
+(defvar-local betterlinear--capture-created-sub-issue nil
+  "Cached (ISSUE DRAFTS KEYWORDS) after successful sub-issue creation.
+Keep this until local insertion succeeds so retrying cannot create duplicates.")
+
 (defvar-local betterlinear--team-search-buffer-team-id nil
   "Linear team id used to refresh the current team search buffer.")
 
@@ -228,6 +239,7 @@ this map if your Org configuration uses a different priority range."
        name
        assignedIssues(first: $first, after: $after) {
          nodes {
+           parent { id identifier title url }
            id
            identifier
            title
@@ -255,6 +267,7 @@ this map if your Org configuration uses a different priority range."
 (defvar betterlinear--issue-query
   "query BetterLinearIssue($id: String!) {
      issue(id: $id) {
+       parent { id identifier title url }
        id
        identifier
        title
@@ -272,6 +285,25 @@ this map if your Org configuration uses a different priority range."
        team { id key name }
        state { id name type }
        project { id name url }
+     }
+   }")
+
+(defvar betterlinear--sub-issues-query
+  "query BetterLinearSubIssues($id: String!, $first: Int!, $after: String) {
+     issue(id: $id) {
+       children(first: $first, after: $after) {
+         nodes {
+           id identifier title description descriptionState url branchName
+           sortOrder priority priorityLabel estimate createdAt updatedAt dueDate
+           parent { id identifier title url }
+           assignee { id name }
+           team { id key name }
+           state { id name type }
+           project { id name url }
+           cycle { id name number startsAt endsAt }
+         }
+         pageInfo { hasNextPage endCursor }
+       }
      }
    }")
 
@@ -402,6 +434,7 @@ request objects. Customize this if your workspace exposes different fields."
        url
        issues(first: $first, after: $after) {
          nodes {
+           parent { id identifier title url }
            id
            identifier
            title
@@ -447,6 +480,7 @@ request objects. Customize this if your workspace exposes different fields."
        url
        issues(first: $first, after: $after, filter: { team: { id: { eq: $teamId } } }) {
          nodes {
+           parent { id identifier title url }
            id
            identifier
            title
@@ -479,6 +513,7 @@ request objects. Customize this if your workspace exposes different fields."
        name
        issues(first: $first, after: $after) {
          nodes {
+           parent { id identifier title url }
            id
            identifier
            title
@@ -517,6 +552,7 @@ request objects. Customize this if your workspace exposes different fields."
          endsAt
          issues(first: $first, after: $after) {
            nodes {
+             parent { id identifier title url }
              id
              identifier
              title
@@ -557,6 +593,7 @@ request objects. Customize this if your workspace exposes different fields."
            endsAt
            issues(first: $first, after: $after) {
              nodes {
+               parent { id identifier title url }
                id
                identifier
                title
@@ -588,6 +625,7 @@ request objects. Customize this if your workspace exposes different fields."
      issueUpdate(id: $id, input: { projectId: $projectId }) {
        success
        issue {
+         parent { id identifier title url }
          id
          identifier
          title
@@ -614,6 +652,7 @@ request objects. Customize this if your workspace exposes different fields."
      issueUpdate(id: $id, input: { assigneeId: $assigneeId }) {
        success
        issue {
+         parent { id identifier title url }
          id
          identifier
          title
@@ -661,10 +700,11 @@ request objects. Customize this if your workspace exposes different fields."
    }")
 
 (defvar betterlinear--create-issue-mutation
-  "mutation BetterLinearCreateIssue($teamId: String!, $title: String!, $description: String, $stateId: String) {
-     issueCreate(input: { teamId: $teamId, title: $title, description: $description, stateId: $stateId }) {
+  "mutation BetterLinearCreateIssue($teamId: String!, $title: String!, $description: String, $stateId: String, $parentId: String) {
+     issueCreate(input: { teamId: $teamId, title: $title, description: $description, stateId: $stateId, parentId: $parentId }) {
        success
        issue {
+         parent { id identifier title url }
          id
          identifier
          title
@@ -691,6 +731,7 @@ request objects. Customize this if your workspace exposes different fields."
      issueUpdate(id: $id, input: $input) {
        success
        issue {
+         parent { id identifier title url }
          id
          identifier
          title
@@ -1153,6 +1194,9 @@ and the issue link."
     (betterlinear--insert-property "LINEAR_ID" (alist-get 'id issue))
     (betterlinear--insert-property "LINEAR_IDENTIFIER" (alist-get 'identifier issue))
     (betterlinear--insert-property "LINEAR_URL" (alist-get 'url issue))
+    (betterlinear--insert-property "LINEAR_PARENT_ID" (alist-get 'id (alist-get 'parent issue)))
+    (betterlinear--insert-property "LINEAR_PARENT_IDENTIFIER" (alist-get 'identifier (alist-get 'parent issue)))
+    (betterlinear--insert-property "LINEAR_PARENT_URL" (alist-get 'url (alist-get 'parent issue)))
     (betterlinear--insert-property "LINEAR_BRANCH" (betterlinear--issue-branch-name issue))
     (betterlinear--insert-property "STATE_ID" (alist-get 'id state))
     (betterlinear--insert-property "STATE" (alist-get 'name state))
@@ -1486,11 +1530,19 @@ PRIORITY is used only when the response has no `priority' field."
           (insert line "\n"))))))
 
 (defun betterlinear--ensure-todo-keyword (keyword)
-  "Ensure KEYWORD is a valid Org TODO keyword in the current buffer."
+  "Ensure KEYWORD is a valid Org TODO keyword in the current buffer.
+
+Update document metadata even when narrowed, without moving point."
   (unless (member keyword org-todo-keywords-1)
-    (let ((keywords (append org-todo-keywords-1 (list keyword))))
-      (betterlinear--write-todo-keyword-line keywords)
-      (betterlinear--set-local-todo-keywords keywords))))
+    (let ((position (copy-marker (point) t)))
+      (unwind-protect
+          (save-restriction
+            (widen)
+            (let ((keywords (append org-todo-keywords-1 (list keyword))))
+              (betterlinear--write-todo-keyword-line keywords)
+              (betterlinear--set-local-todo-keywords keywords)))
+        (goto-char position)
+        (set-marker position nil)))))
 
 (defun betterlinear--insert-pr-property (name value)
   "Insert Org property NAME with VALUE when VALUE is non-empty."
@@ -1530,29 +1582,118 @@ PRIORITY is used only when the response has no `priority' field."
     (betterlinear--set-local-todo-keywords '("REVIEW"))
     (goto-char (point-min))))
 
+(defun betterlinear--issue-tree-entries (issues &optional level)
+  "Return (ISSUE LEVEL) pairs for ISSUES in parent-first order.
+
+Only nest under parents present in ISSUES.  Deduplicate by id, preserve root
+and sibling order, and tolerate malformed parent cycles without looping."
+  (let ((by-id (make-hash-table :test #'equal))
+        (children (make-hash-table :test #'equal))
+        (seen (make-hash-table :test #'equal))
+        unique result)
+    (dolist (issue issues)
+      (let ((key (or (alist-get 'id issue) issue)))
+        (unless (gethash key by-id)
+          (puthash key issue by-id)
+          (push issue unique))))
+    (setq unique (nreverse unique))
+    (dolist (issue unique)
+      (let ((parent (alist-get 'id (alist-get 'parent issue))))
+        (when parent
+          (push issue (gethash parent children)))))
+    (cl-labels ((visit (issue depth)
+                  (let ((key (or (alist-get 'id issue) issue)))
+                    (unless (gethash key seen)
+                      (puthash key t seen)
+                      (push (list issue depth) result)
+                      (when (alist-get 'id issue)
+                        (dolist (child (reverse (gethash (alist-get 'id issue) children)))
+                          (visit child (1+ depth))))))))
+      (dolist (issue unique)
+        (unless (gethash (alist-get 'id (alist-get 'parent issue)) by-id)
+          (visit issue (or level 1))))
+      ;; Cycles have no root; still display every issue once.
+      (dolist (issue unique) (visit issue (or level 1))))
+    (nreverse result)))
+
+(defun betterlinear--relevel-subtree (text level)
+  "Return Org subtree TEXT shifted to heading LEVEL."
+  (with-temp-buffer
+    (delay-mode-hooks (org-mode))
+    (org-paste-subtree level text)
+    (buffer-string)))
+
+(defun betterlinear--org-entry-drafts-map ()
+  "Return local draft subtrees keyed by their owning Linear issue id.
+
+Values are lists of (RELATIVE-LEVEL TEXT) pairs."
+  (let ((drafts (make-hash-table :test #'equal)))
+    (when (derived-mode-p 'org-mode)
+      (org-map-entries
+       (lambda ()
+         (when-let* ((id (org-entry-get (point) "LINEAR_ID" nil)))
+           (let ((level (org-outline-level)) children)
+             (dolist (region (betterlinear--current-entry-child-regions))
+               (unless (org-entry-get (car region) "LINEAR_ID" nil)
+                 (save-excursion
+                   (goto-char (car region))
+                   ;; Existing issues render independently from query results,
+                   ;; even if manually moved beneath a draft.  Their own local
+                   ;; drafts are preserved separately under their issue ids.
+                   (push (list (- (nth 2 region) level)
+                               (betterlinear--substring-without-regions
+                                (car region) (nth 1 region)
+                                (betterlinear--current-entry-child-regions t)))
+                         children))))
+             (when children (puthash id (nreverse children) drafts)))))))
+    drafts))
+
+(defun betterlinear--insert-drafts (drafts level)
+  "Insert saved DRAFTS relative to their owner's heading LEVEL."
+  (dolist (draft drafts)
+    (insert (betterlinear--relevel-subtree (nth 1 draft) (+ level (car draft))))
+    (unless (bolp) (insert "\n"))))
+
 (defun betterlinear--insert-my-issues-org (issues &optional title empty-message)
   "Insert ISSUES into the current buffer as Org content.
 
-TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil."
-  (let ((inhibit-read-only t)
-        (todo-keywords (betterlinear--todo-keywords-for-issues issues))
-        (planning-map (betterlinear--org-entry-planning-map))
-        (priority-map (betterlinear--org-entry-priority-map)))
-    (erase-buffer)
-    (insert (format "#+TITLE: %s\n" (or title "Linear issues assigned to me")))
-    (insert (format "#+DATE: %s\n" (format-time-string "%Y-%m-%d %H:%M:%S %Z")))
-    (insert (format "#+TODO: %s\n" (string-join todo-keywords " ")))
-    (insert "#+STARTUP: overview\n\n")
-    (if issues
-        (dolist (issue issues)
-          (betterlinear--insert-issue
-           issue
-           nil
-           (betterlinear--planning-for-issue issue planning-map)
-           (betterlinear--priority-for-issue issue priority-map)))
-      (insert (or empty-message "No assigned Linear issues found.\n")))
-    (betterlinear--set-local-todo-keywords todo-keywords)
-    (goto-char (point-min))))
+TITLE is the Org document title.  EMPTY-MESSAGE is inserted when ISSUES is nil.
+Nest children only when their parents are included.  Preserve local drafts;
+refuse to erase drafts whose owning issue is absent from the new results."
+  (save-restriction
+    (widen)
+    (let* ((inhibit-read-only t)
+           (drafts-map (betterlinear--org-entry-drafts-map))
+           (todo-keywords
+            (delete-dups
+             (append (betterlinear--todo-keywords-for-issues issues)
+                     (when (> (hash-table-count drafts-map) 0)
+                       (copy-sequence org-todo-keywords-1)))))
+           (planning-map (betterlinear--org-entry-planning-map))
+           (priority-map (betterlinear--org-entry-priority-map)))
+      (maphash
+       (lambda (id _drafts)
+         (unless (seq-find (lambda (issue) (equal id (alist-get 'id issue))) issues)
+           (user-error "Issue %s has local sub-issue drafts; create or move them before refreshing this view" id)))
+       drafts-map)
+      (atomic-change-group
+        (erase-buffer)
+        (insert (format "#+TITLE: %s\n" (or title "Linear issues assigned to me")))
+        (insert (format "#+DATE: %s\n" (format-time-string "%Y-%m-%d %H:%M:%S %Z")))
+        (insert (format "#+TODO: %s\n" (string-join todo-keywords " ")))
+        (insert "#+STARTUP: overview\n\n")
+        (if issues
+            (dolist (entry (betterlinear--issue-tree-entries issues))
+              (let ((issue (car entry)) (level (nth 1 entry)))
+                (betterlinear--insert-issue
+                 issue level
+                 (betterlinear--planning-for-issue issue planning-map)
+                 (betterlinear--priority-for-issue issue priority-map))
+                (betterlinear--insert-drafts
+                 (gethash (alist-get 'id issue) drafts-map) level)))
+          (insert (or empty-message "No assigned Linear issues found.\n")))
+        (betterlinear--set-local-todo-keywords todo-keywords)
+        (goto-char (point-min))))))
 
 (defun betterlinear--revert-my-issues-buffer (&rest _args)
   "Refresh the current BetterLinear issues buffer."
@@ -1786,19 +1927,61 @@ Each value is a priority character (e.g. ?A) for entries that have an explicit
         (delete-region (car region) (cdr region))))
     (buffer-string)))
 
+(defun betterlinear--substring-without-regions (beg end regions)
+  "Return text from BEG to END, omitting sorted, nonoverlapping REGIONS."
+  (let ((cursor beg) parts)
+    (dolist (region regions)
+      (push (buffer-substring-no-properties cursor (car region)) parts)
+      (setq cursor (nth 1 region)))
+    (push (buffer-substring-no-properties cursor end) parts)
+    (apply #'concat (nreverse parts))))
+
+(defun betterlinear--current-entry-child-regions (&optional existing-only)
+  "Return outermost sub-issue regions below the current heading.
+
+Each region is (BEG END LEVEL).  A heading with its own LINEAR_ID or any
+configured Org TODO keyword (including done keywords) is a sub-issue.
+Ordinary headings are description content.  Ignore headings in source blocks.
+When EXISTING-ONLY is non-nil, find only LINEAR_ID entries, including those
+nested beneath drafts."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((root (point)) (covered-until (point)) regions)
+      (save-restriction
+        (org-narrow-to-subtree)
+        (org-element-map (org-element-parse-buffer) 'headline
+          (lambda (headline)
+            (let ((beg (org-element-property :begin headline))
+                  (end (org-element-property :end headline)))
+              (when (and (> beg root) (>= beg covered-until)
+                         (or (and (not existing-only)
+                                  (org-element-property :todo-keyword headline))
+                             (org-entry-get beg "LINEAR_ID" nil)))
+                (push (list beg end (org-element-property :level headline)) regions)
+                (setq covered-until end))))))
+      (nreverse regions))))
+
+(defun betterlinear--current-entry-children ()
+  "Return the current entry's sub-issue subtrees as Org strings."
+  (mapcar (lambda (region)
+            (buffer-substring-no-properties (car region) (nth 1 region)))
+          (betterlinear--current-entry-child-regions)))
+
 (defun betterlinear--current-org-entry-description ()
   "Return the current Org entry body as a Linear Markdown description, or nil.
 
 The description starts after the entry heading, planning line, and property
-drawer, includes child subtrees, and is converted from Org to Markdown. All
-drawers, including those in child subtrees, are excluded. Child heading levels
-are normalized relative to the current entry before conversion."
+drawer and is converted from Org to Markdown.  Ordinary child headings are
+included, but sub-issue subtrees (LINEAR_ID or TODO headings) are excluded.
+All drawers are excluded.  Child heading levels are normalized relative to
+the current entry before conversion."
   (unless (derived-mode-p 'org-mode)
     (user-error "This command must be run from an Org buffer"))
   (save-excursion
     (org-back-to-heading t)
     (let* ((parent-level (org-outline-level))
            (subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+           (children (betterlinear--current-entry-child-regions))
            beg description)
       (forward-line 1)
       (while (and (< (point) subtree-end)
@@ -1813,7 +1996,7 @@ are normalized relative to the current entry before conversion."
       (setq description
             (string-trim
              (betterlinear--org-body-without-drawers
-              (buffer-substring-no-properties beg subtree-end))))
+              (betterlinear--substring-without-regions beg subtree-end children))))
       (unless (string-empty-p description)
         (betterlinear-org-to-markdown
          (betterlinear--normalize-org-body-headings description parent-level))))))
@@ -1828,7 +2011,10 @@ are normalized relative to the current entry before conversion."
       (list beg (point) level))))
 
 (defun betterlinear--replace-current-entry-with-issue (issue &optional planning priority)
-  "Replace the current Org subtree with Linear ISSUE, preserving heading level.
+  "Replace the current Org entry with Linear ISSUE, preserving sub-issues.
+
+Keep existing LINEAR_ID and TODO child subtrees, including local drafts, and
+the current heading level.  Ordinary description content is replaced.
 
 Org planning lines (SCHEDULED, DEADLINE, CLOSED) are local metadata and are
 preserved on every refresh/replacement but are never sent to Linear.  When
@@ -1837,7 +2023,8 @@ current entry.  ISSUE's Linear priority takes precedence over PRIORITY and the
 current entry's priority cookie.  A local cookie is preserved only when the
 response does not contain a `priority' field."
   (let ((planning (or planning (betterlinear--current-org-entry-planning)))
-        (priority (or priority (betterlinear--current-org-entry-priority))))
+        (priority (or priority (betterlinear--current-org-entry-priority)))
+        (children (betterlinear--current-entry-children)))
     (pcase-let ((`(,beg ,end ,level) (betterlinear--current-subtree-region-and-level)))
       (let ((inhibit-read-only t)
             (todo-keyword (betterlinear--todo-keyword
@@ -1846,6 +2033,9 @@ response does not contain a `priority' field."
         (delete-region beg end)
         (goto-char beg)
         (betterlinear--insert-issue issue level planning priority)
+        (dolist (child children)
+          (insert child)
+          (unless (bolp) (insert "\n")))
         (setq heading-marker (copy-marker beg t))
         (betterlinear--ensure-todo-keyword todo-keyword)
         (goto-char heading-marker)
@@ -2394,16 +2584,20 @@ team without prompting, unless a prefix argument is active."
           (or (betterlinear--string (alist-get 'id team))
               (alist-get 'id (betterlinear--read-team teams)))))))
 
-(defun betterlinear-create-issue (team-id title &optional description state-id)
+(defun betterlinear-create-issue (team-id title &optional description state-id parent-id)
   "Create a Linear issue in TEAM-ID with TITLE and DESCRIPTION.
 
 When STATE-ID is non-nil, create the issue in that Linear workflow state.
+When PARENT-ID is non-nil, create a sub-issue of that Linear issue.
 Return the created issue."
   (let* ((variables `((teamId . ,team-id)
                       (title . ,title)
                       (description . ,description)))
          (variables (if state-id
                         (append variables `((stateId . ,state-id)))
+                      variables))
+         (variables (if parent-id
+                        (append variables `((parentId . ,parent-id)))
                       variables))
          (data (betterlinear--graphql betterlinear--create-issue-mutation
                                       variables))
@@ -2429,6 +2623,43 @@ DESCRIPTION clears the issue description.  Return the updated issue."
     (unless (eq (alist-get 'success payload) t)
       (error "Linear failed to update issue %s" issue-id))
     (alist-get 'issue payload)))
+
+(defun betterlinear-sub-issues (issue-id)
+  "Return all descendants of Linear ISSUE-ID as a flat list.
+
+Fetch every page of each child connection.  Deduplicate ids and guard against
+cycles.  This explicit operation is not used by filtered list queries."
+  (let ((seen (make-hash-table :test #'equal))
+        (pending (list issue-id)) result)
+    (puthash issue-id t seen)
+    (while pending
+      (let ((parent-id (pop pending)) after (more t)
+            (cursors (make-hash-table :test #'equal)))
+        (while more
+          (let* ((data (betterlinear--graphql
+                        betterlinear--sub-issues-query
+                        `((id . ,parent-id) (first . ,betterlinear-issues-page-size)
+                          (after . ,after))))
+                 (parent (or (alist-get 'issue data)
+                             (error "Linear issue not found: %s" parent-id)))
+                 (connection (alist-get 'children parent))
+                 (page-info (alist-get 'pageInfo connection)))
+            (dolist (child (alist-get 'nodes connection))
+              (let ((id (or (alist-get 'id child)
+                            (error "Linear returned a sub-issue without an id"))))
+                (unless (gethash id seen)
+                  (puthash id t seen)
+                  (unless (alist-get 'id (alist-get 'parent child))
+                    (setf (alist-get 'parent child) `((id . ,parent-id))))
+                  (push child result)
+                  (push id pending))))
+            (setq more (eq (alist-get 'hasNextPage page-info) t)
+                  after (alist-get 'endCursor page-info))
+            (when more
+              (when (or (null after) (gethash after cursors))
+                (error "Invalid pagination cursor for sub-issues of %s" parent-id))
+              (puthash after t cursors))))))
+    (nreverse result)))
 
 (defun betterlinear--issue-with-description (issue description)
   "Return ISSUE with DESCRIPTION as its Markdown description when non-empty.
@@ -2724,6 +2955,19 @@ listing commands, but it contains the single captured issue."
     buffer))
 
 (defun betterlinear-capture-finalize ()
+  "Finish the current Linear issue or sub-issue capture.
+
+For `betterlinear-capture-sub-issue', create the child and insert its Org entry
+under the original parent without saving the file.  Otherwise show the created
+issue in a new buffer.  On failure keep the capture for correction or retry."
+  (interactive)
+  (unless (derived-mode-p 'betterlinear-capture-mode)
+    (user-error "This command must be run from a BetterLinear capture buffer"))
+  (if betterlinear--capture-parent-issue
+      (betterlinear--capture-sub-issue-finalize)
+    (betterlinear--capture-issue-finalize)))
+
+(defun betterlinear--capture-issue-finalize ()
   "Create a Linear issue from the temporary capture buffer.
 
 The capture buffer is not saved to any Org file.  The first Org heading is used
@@ -2739,13 +2983,15 @@ After the issue is created the temporary capture buffer is killed and a new
   (unless (derived-mode-p 'betterlinear-capture-mode)
     (user-error "This command must be run from a BetterLinear capture buffer"))
   (let ((buffer (current-buffer))
-        title description team-id todo-keyword state-id issue identifier url)
+        title description team-id todo-keyword state-id issue identifier url children
+        (draft-keywords (copy-sequence org-todo-keywords-1)))
     (save-excursion
       (betterlinear--goto-capture-heading)
       (when (org-entry-get (point) "LINEAR_ID")
         (user-error "Capture entry already has a LINEAR_ID property"))
       (setq title (betterlinear--current-org-entry-title))
       (setq description (betterlinear--current-org-entry-description))
+      (setq children (betterlinear--current-entry-children))
       (setq todo-keyword (betterlinear--current-org-entry-todo-keyword))
       (setq team-id (or (org-entry-get (point) "TEAM_ID")
                         (org-entry-get (point) "LINEAR_TEAM_ID")
@@ -2759,18 +3005,32 @@ After the issue is created the temporary capture buffer is killed and a new
                          "created issue"))
     (setq url (betterlinear--string (alist-get 'url issue)))
     (betterlinear--kill-capture-buffer buffer)
-    (betterlinear--show-captured-issue-org issue)
+    (let ((output (betterlinear--show-captured-issue-org issue)))
+      (with-current-buffer output
+        (goto-char (point-max))
+        (dolist (child children) (insert child))
+        (when children
+          (dolist (keyword draft-keywords)
+            (betterlinear--ensure-todo-keyword keyword)))
+        (goto-char (point-min))))
     (message "Created Linear issue %s%s"
              identifier
              (if url (format " — %s" url) ""))))
 
 (defun betterlinear-capture-abort ()
-  "Abort the temporary BetterLinear issue capture without creating anything."
+  "Close the temporary BetterLinear capture without creating anything new.
+
+If creation already succeeded but local insertion failed, do not delete the
+remotely created issue."
   (interactive)
   (unless (derived-mode-p 'betterlinear-capture-mode)
     (user-error "This command must be run from a BetterLinear capture buffer"))
-  (betterlinear--kill-capture-buffer (current-buffer))
-  (message "Aborted Linear issue capture"))
+  (let ((created (car betterlinear--capture-created-sub-issue)))
+    (betterlinear--kill-capture-buffer (current-buffer))
+    (if created
+        (message "Closed capture; Linear sub-issue %s was already created"
+                 (or (alist-get 'identifier created) (alist-get 'id created)))
+      (message "Aborted Linear issue capture"))))
 
 ;;;###autoload
 (defun betterlinear-capture-issue (team)
@@ -2799,7 +3059,287 @@ showing the created issue.  Abort with `betterlinear-capture-abort'
       (betterlinear--goto-capture-heading)
       (end-of-line))
     (pop-to-buffer buffer)
-    (message "Edit the issue, then C-c C-c to create it or C-c C-k to abort")))
+    (message "Edit the issue, then C-c C-c to create it or C-c C-k to abort")
+    buffer))
+
+(defun betterlinear--capture-release-parent-marker ()
+  "Release the source marker when a sub-issue capture is closed."
+  (when (markerp betterlinear--capture-parent-marker)
+    (set-marker betterlinear--capture-parent-marker nil)))
+
+(defun betterlinear--agenda-issue-candidates ()
+  "Return completion candidates for Linear entries in Org agenda files.
+
+Each candidate is (LABEL . MARKER).  Include entries with their own LINEAR_ID,
+regardless of TODO state.  Read live buffers, including unsaved edits, without
+changing their point or narrowing.  Caller must release the markers."
+  (let (candidates)
+    (dolist (file (org-agenda-files t))
+      (when (or (get-file-buffer file) (file-readable-p file))
+        (with-current-buffer (org-get-agenda-file-buffer file)
+          (save-excursion
+            (save-restriction
+              (widen)
+              (org-map-entries
+               (lambda ()
+                 (when-let* ((id (org-entry-get (point) "LINEAR_ID" nil)))
+                   (let* ((identifier (org-entry-get (point) "LINEAR_IDENTIFIER" nil))
+                          (title (condition-case nil
+                                     (betterlinear--current-org-entry-title)
+                                   (user-error "(untitled)")))
+                          (label (format "%s — %s (%s:%d)"
+                                         (or identifier id) title
+                                         (abbreviate-file-name file)
+                                         (line-number-at-pos))))
+                     (push (cons label (copy-marker (point) t)) candidates))))))))))
+    (nreverse candidates)))
+
+(defun betterlinear--read-agenda-issue ()
+  "Prompt for a Linear entry in agenda files and return a fresh marker."
+  (let ((candidates (betterlinear--agenda-issue-candidates)))
+    (unwind-protect
+        (progn
+          (unless candidates
+            (user-error "No Linear issues with LINEAR_ID found in Org agenda files"))
+          (let* ((choice (completing-read "Parent Linear issue: " candidates nil t))
+                 (marker (cdr (assoc choice candidates))))
+            (unless marker (user-error "No parent issue selected"))
+            (copy-marker marker t)))
+      (dolist (candidate candidates) (set-marker (cdr candidate) nil)))))
+
+;;;###autoload
+(defun betterlinear-capture-sub-issue ()
+  "Capture a sub-issue for a Linear entry selected from Org agenda files.
+
+Prompt for an entry with its own LINEAR_ID property, showing its identifier,
+title, file, and line.  This command can be called from any buffer.  C-c C-c
+creates the child and inserts its Org entry under the selected parent; C-c C-k
+cancels.  The parent's file is not saved automatically."
+  (interactive)
+  (let ((marker (betterlinear--read-agenda-issue)))
+    (unwind-protect
+        (with-current-buffer (marker-buffer marker)
+          (save-excursion
+            (save-restriction
+              (widen)
+              (goto-char marker)
+              (betterlinear--capture-sub-issue-at-point))))
+      (set-marker marker nil))))
+
+(defun betterlinear--capture-sub-issue-at-point ()
+  "Capture a sub-issue for the Linear Org entry at point.
+
+Open a temporary capture buffer using the parent's team.  C-c C-c creates the
+child in Linear and inserts it under the original Org parent, even in a
+read-only source buffer.  C-c C-k cancels.  Neither operation saves the file.
+The source entry must have its own LINEAR_ID property."
+  (let* ((id (betterlinear--current-issue-id))
+         (parent
+          (save-excursion
+            (org-back-to-heading t)
+            `((id . ,id)
+              (identifier . ,(org-entry-get (point) "LINEAR_IDENTIFIER" nil))
+              (url . ,(org-entry-get (point) "LINEAR_URL" nil))
+              (team . ((id . ,(org-entry-get (point) "TEAM_ID" nil))
+                       (key . ,(org-entry-get (point) "TEAM" nil)))))))
+         (team (or (and (alist-get 'id (alist-get 'team parent))
+                        (alist-get 'team parent))
+                   (alist-get 'team (betterlinear-issue id))))
+         (marker (save-excursion
+                   (org-back-to-heading t)
+                   (copy-marker (point) t)))
+         capture)
+    (unless (alist-get 'id team)
+      (set-marker marker nil)
+      (user-error "Could not determine the parent issue's team"))
+    (unwind-protect
+        (progn
+          (setq capture (betterlinear-capture-issue team))
+          (with-current-buffer capture
+            (setq-local betterlinear--capture-parent-issue parent)
+            (setq-local betterlinear--capture-parent-marker marker)
+            (add-hook 'kill-buffer-hook #'betterlinear--capture-release-parent-marker nil t)
+            (save-excursion
+              (goto-char (point-min))
+              (insert (format "# Sub-issue of %s\n"
+                              (or (alist-get 'identifier parent) id))))
+            (set-buffer-modified-p nil))
+          (message "Capture sub-issue of %s; C-c C-c to create, C-c C-k to abort"
+                   (or (alist-get 'identifier parent) id))
+          capture)
+      (unless (buffer-live-p capture) (set-marker marker nil)))))
+
+(defun betterlinear--capture-parent-buffer ()
+  "Return the live source buffer after validating this capture's parent.
+
+Fail before creating an issue if the original parent has disappeared."
+  (let* ((marker betterlinear--capture-parent-marker)
+         (source (and (markerp marker) (marker-buffer marker)))
+         (id (alist-get 'id betterlinear--capture-parent-issue)))
+    (unless (and source
+                 (with-current-buffer source
+                   (save-excursion
+                     (save-restriction
+                       (widen)
+                       (goto-char marker)
+                       (and (derived-mode-p 'org-mode)
+                            (bolp) (org-at-heading-p)
+                            (equal id (org-entry-get (point) "LINEAR_ID" nil)))))))
+      (user-error "The original Org parent is gone or changed; capture has been kept"))
+    source))
+
+(defun betterlinear--capture-sub-issue-finalize ()
+  "Create a captured child and insert it beneath the original Org parent.
+
+Cache a successful API response before editing the source.  If local insertion
+fails, C-c C-c retries insertion without making another Linear issue."
+  (let* ((capture (current-buffer))
+         (source (betterlinear--capture-parent-buffer))
+         (parent betterlinear--capture-parent-issue)
+         (parent-marker betterlinear--capture-parent-marker)
+         (snapshot betterlinear--capture-created-sub-issue)
+         inserted)
+    (unless snapshot
+      (save-excursion
+        (betterlinear--goto-capture-heading)
+        (when (org-entry-get (point) "LINEAR_ID" nil)
+          (user-error "Capture entry already has a LINEAR_ID property"))
+        (let* ((title (betterlinear--current-org-entry-title))
+               (description (betterlinear--current-org-entry-description))
+               (keyword (betterlinear--current-org-entry-todo-keyword))
+               (team-id (if (or (org-entry-get (point) "TEAM_ID" nil)
+                                (org-entry-get (point) "LINEAR_TEAM_ID" nil)
+                                (org-entry-get (point) "TEAM" nil))
+                            (betterlinear--read-team-id-at-point)
+                          betterlinear--capture-team-id))
+               (state-id (betterlinear--state-id-for-todo-keyword team-id keyword))
+               (level (org-outline-level))
+               (drafts (mapcar
+                        (lambda (region)
+                          (list (- (nth 2 region) level)
+                                (buffer-substring-no-properties (car region) (nth 1 region))))
+                        (betterlinear--current-entry-child-regions)))
+               (issue (betterlinear-create-issue
+                       team-id title description state-id (alist-get 'id parent))))
+          (setq issue (betterlinear--issue-with-description issue description))
+          (unless (alist-get 'id (alist-get 'parent issue))
+            (setf (alist-get 'parent issue) parent))
+          (setq snapshot (list issue drafts (copy-sequence org-todo-keywords-1))
+                betterlinear--capture-created-sub-issue snapshot))))
+    ;; Revalidate after the request as well: the source may have changed.
+    (betterlinear--capture-parent-buffer)
+    (pcase-let ((`(,issue ,drafts ,keywords) snapshot))
+      (unwind-protect
+          (progn
+            (with-current-buffer source
+              (let ((inhibit-read-only t))
+                (save-restriction
+                  (widen)
+                  (atomic-change-group
+                    (betterlinear--ensure-todo-keyword
+                     (betterlinear--todo-keyword (alist-get 'name (alist-get 'state issue))))
+                    (when drafts
+                      (dolist (keyword keywords) (betterlinear--ensure-todo-keyword keyword)))
+                    (goto-char parent-marker)
+                    (let ((level (1+ (org-outline-level))))
+                      (org-end-of-subtree t t)
+                      (unless (bolp) (insert "\n"))
+                      (setq inserted (copy-marker (point)))
+                      (betterlinear--insert-issue issue level)
+                      (betterlinear--insert-drafts drafts level))))))
+            (betterlinear--kill-capture-buffer capture)
+            (pop-to-buffer source)
+            (with-current-buffer source
+              (widen)
+              (goto-char inserted)
+              (org-reveal))
+            (message "Created Linear sub-issue %s"
+                     (or (alist-get 'identifier issue) (alist-get 'id issue)))
+            issue)
+        (when inserted (set-marker inserted nil))))))
+
+(defun betterlinear--enclosing-linear-issue ()
+  "Return the enclosing Linear issue's local metadata, or nil.
+
+Ignore ordinary description headings.  Signal an error if an uncreated TODO
+ancestor intervenes: it must be created before its own children."
+  (save-excursion
+    (save-restriction
+      (widen)
+      (org-back-to-heading t)
+      (catch 'parent
+        (while (org-up-heading-safe)
+          (let ((id (org-entry-get (point) "LINEAR_ID" nil)))
+            (cond
+             (id (throw 'parent
+                        `((id . ,id)
+                          (identifier . ,(org-entry-get (point) "LINEAR_IDENTIFIER" nil))
+                          (url . ,(org-entry-get (point) "LINEAR_URL" nil))
+                          (team . ((id . ,(org-entry-get (point) "TEAM_ID" nil)))))))
+             ((org-get-todo-state)
+              (user-error "Create the enclosing sub-issue draft first")))))
+        nil))))
+
+;;;###autoload
+(defun betterlinear-add-sub-issue ()
+  "Insert a TODO sub-issue draft beneath the current Linear issue.
+
+This only edits Org; no Linear issue is created.  Edit the title and body,
+then run `betterlinear-create-sub-issue-from-org-entry'."
+  (interactive)
+  (betterlinear--current-issue-id)
+  (barf-if-buffer-read-only)
+  (betterlinear--ensure-todo-keyword "TODO")
+  (org-back-to-heading t)
+  (let ((level (1+ (org-outline-level))))
+    (org-end-of-subtree t t)
+    (unless (bolp) (insert "\n"))
+    (insert (make-string level ?*) " TODO \n")
+    (backward-char 1)))
+
+;;;###autoload
+(defun betterlinear-create-sub-issue-from-org-entry ()
+  "Create the current TODO draft as a sub-issue in Linear.
+
+Use the nearest enclosing Linear issue as parent and default to its team.
+Explicit TEAM_ID/LINEAR_TEAM_ID/TEAM properties on the draft override that
+team.  Create only this entry, preserving nested drafts.  Moving an existing
+entry never reparents it; entries with LINEAR_ID cannot be created again."
+  (interactive)
+  (unless (derived-mode-p 'org-mode)
+    (user-error "This command must be run from an Org buffer"))
+  (save-excursion
+    (org-back-to-heading t)
+    (when (org-entry-get (point) "LINEAR_ID" nil)
+      (user-error "Current Org entry already has a LINEAR_ID property"))
+    (unless (org-get-todo-state)
+      (user-error "A sub-issue draft must have an Org TODO keyword")))
+  (let* ((parent (or (betterlinear--enclosing-linear-issue)
+                     (user-error "No enclosing Linear issue; create the parent first")))
+         (parent-id (alist-get 'id parent))
+         (title (betterlinear--current-org-entry-title))
+         (description (betterlinear--current-org-entry-description))
+         (keyword (betterlinear--current-org-entry-todo-keyword))
+         (team-id
+          (save-excursion
+            (org-back-to-heading t)
+            (if (or (org-entry-get (point) "TEAM_ID" nil)
+                    (org-entry-get (point) "LINEAR_TEAM_ID" nil)
+                    (org-entry-get (point) "TEAM" nil))
+                (betterlinear--read-team-id-at-point)
+              (or (alist-get 'id (alist-get 'team parent))
+                  (alist-get 'id (alist-get 'team (betterlinear-issue parent-id)))
+                  (user-error "Could not determine the parent issue's team")))))
+         (state-id (betterlinear--state-id-for-todo-keyword team-id keyword))
+         (issue (betterlinear-create-issue team-id title description state-id parent-id)))
+    (setq issue (betterlinear--issue-with-description issue description))
+    ;; Keep the relationship locally even if the creation response omits it.
+    (unless (alist-get 'id (alist-get 'parent issue))
+      (setf (alist-get 'parent issue) parent))
+    (betterlinear--replace-current-entry-with-issue issue)
+    (message "Created Linear sub-issue %s"
+             (or (alist-get 'identifier issue) (alist-get 'id issue)))
+    issue))
 
 ;;;###autoload
 (defun betterlinear-create-issue-from-org-entry (team-id)
@@ -2807,8 +3347,8 @@ showing the created issue.  Abort with `betterlinear-capture-abort'
 
 The Org heading becomes the Linear title. The entry's TODO keyword is matched
 against the team's Linear workflow states and used as the new issue state. The
-entry body, after any planning line and property drawer and before the first
-child heading, becomes the Linear description. Interactively, use
+entry body and ordinary child headings become the Linear description;
+TODO child headings are preserved as sub-issue drafts.  Interactively, use
 TEAM_ID/LINEAR_TEAM_ID/TEAM properties when present, otherwise prompt for a
 Linear team.
 
@@ -2819,6 +3359,8 @@ keeping the same heading level."
     (org-back-to-heading t)
     (when (org-entry-get (point) "LINEAR_ID")
       (user-error "Current Org entry already has a LINEAR_ID property")))
+  (when (betterlinear--enclosing-linear-issue)
+    (user-error "Use betterlinear-create-sub-issue-from-org-entry under a Linear issue"))
   (let* ((title (betterlinear--current-org-entry-title))
          (planning (betterlinear--current-org-entry-planning))
          (todo-keyword (betterlinear--current-org-entry-todo-keyword))
@@ -2909,6 +3451,80 @@ a LINEAR_ID property, as entries generated by `betterlinear-my-issues-org' do."
     (message "Refreshed %s" (or (betterlinear--string (alist-get 'identifier issue))
                                 issue-id))))
 
+(defun betterlinear--issue-marker-map ()
+  "Return markers for existing Linear entries, keyed by id.
+
+Markers advance on insertion so appending a child before a sibling does not
+move the sibling's marker onto the new child.  Caller must release markers."
+  (let ((markers (make-hash-table :test #'equal)))
+    (save-excursion
+      (save-restriction
+        (widen)
+        (org-map-entries
+         (lambda ()
+           (when-let* ((id (org-entry-get (point) "LINEAR_ID" nil)))
+             (unless (gethash id markers)
+               (puthash id (copy-marker (point) t) markers)))))))
+    markers))
+
+(defun betterlinear--release-issue-markers (markers)
+  "Detach all markers in MARKERS."
+  (when markers
+    (maphash (lambda (_id marker) (set-marker marker nil)) markers)))
+
+;;;###autoload
+(defun betterlinear-fetch-sub-issues ()
+  "Fetch and display all sub-issues of the Linear entry at point.
+
+This explicitly imports descendants regardless of list filters.  Fetch the
+whole tree before editing.  Refresh existing entries in place, preserve local
+TODO drafts and planning, and insert missing children under their parents.
+Never create issues, delete absent children, or reparent anything in Linear.
+Return the number of fetched descendants."
+  (interactive)
+  (let* ((id (betterlinear--current-issue-id))
+         (issues (betterlinear-sub-issues id))
+         (inhibit-read-only t)
+         markers)
+    (unwind-protect
+        (save-excursion
+          (save-restriction
+            (widen)
+            (setq markers (betterlinear--issue-marker-map))
+            (atomic-change-group
+              ;; Refresh bottom-up so a parent preserves updated children.
+              (let (existing)
+                (dolist (issue issues)
+                  (when-let* ((marker (gethash (alist-get 'id issue) markers)))
+                    (push (cons marker issue) existing)))
+                (dolist (entry (sort existing (lambda (a b) (> (car a) (car b)))))
+                  (goto-char (car entry))
+                  (betterlinear--replace-current-entry-with-issue (cdr entry))))
+              ;; Replacing parents reinserts their child text: rebuild markers.
+              (betterlinear--release-issue-markers markers)
+              (setq markers (betterlinear--issue-marker-map))
+              (dolist (entry (betterlinear--issue-tree-entries issues))
+                (let* ((issue (car entry))
+                       (child-id (alist-get 'id issue))
+                       (parent-id (alist-get 'id (alist-get 'parent issue))))
+                  (unless (gethash child-id markers)
+                    (let ((parent (or (gethash parent-id markers)
+                                      (error "No Org entry for parent %s" parent-id))))
+                      (betterlinear--ensure-todo-keyword
+                       (betterlinear--todo-keyword (alist-get 'name (alist-get 'state issue))))
+                      (goto-char parent)
+                      (let ((level (1+ (org-outline-level)))
+                            (inhibit-read-only t) beg)
+                        (org-end-of-subtree t t)
+                        (unless (bolp) (insert "\n"))
+                        (setq beg (point))
+                        (betterlinear--insert-issue issue level)
+                        (puthash child-id (copy-marker beg t) markers)))))))
+            (message "Fetched %d Linear sub-issue%s"
+                     (length issues) (if (= (length issues) 1) "" "s"))
+            (length issues)))
+      (betterlinear--release-issue-markers markers))))
+
 ;;;###autoload
 (defun betterlinear-refresh-all-issues ()
   "Refresh every entry with its own LINEAR_ID in the current Org buffer.
@@ -2927,38 +3543,23 @@ Return the number of refreshed entries."
         (save-excursion
           (save-restriction
             (widen)
-            (goto-char (point-min))
-            (while (re-search-forward org-heading-regexp nil t)
-              (beginning-of-line)
-              (when-let* ((id (org-entry-get (point) "LINEAR_ID" nil)))
-                (push (list (copy-marker (point))
-                            (copy-marker
-                             (save-excursion (org-end-of-subtree t t) (point)))
-                            id)
-                      entries))
-              (forward-line 1))
-            ;; Entries are in reverse buffer order.  Stop a parent's replacement
-            ;; before its first nested Linear entry, so it cannot delete it.
-            (let (next-start)
-              (dolist (entry entries)
-                (when (and next-start (< next-start (marker-position (nth 1 entry))))
-                  (set-marker (nth 1 entry) next-start))
-                (setq next-start (marker-position (car entry)))))
-            ;; A failed fetch leaves the buffer untouched.
+            (org-map-entries
+             (lambda ()
+               (when-let* ((id (org-entry-get (point) "LINEAR_ID" nil)))
+                 (push (list (copy-marker (point) t) id) entries))))
+            ;; A failed fetch leaves the buffer untouched.  Refresh bottom-up;
+            ;; replacing a parent preserves the already-refreshed children.
             (dolist (entry entries)
-              (setcdr (last entry) (list (betterlinear-issue (nth 2 entry)))))
+              (setcdr (last entry) (list (betterlinear-issue (nth 1 entry)))))
             (atomic-change-group
               (dolist (entry entries)
-                (save-restriction
-                  (narrow-to-region (car entry) (nth 1 entry))
-                  (goto-char (point-min))
-                  (betterlinear--replace-current-entry-with-issue (nth 3 entry)))))
+                (goto-char (car entry))
+                (betterlinear--replace-current-entry-with-issue (nth 2 entry))))
             (message "Refreshed %d Linear issue%s"
                      (length entries) (if (= (length entries) 1) "" "s"))
             (length entries)))
       (dolist (entry entries)
-        (set-marker (car entry) nil)
-        (set-marker (nth 1 entry) nil)))))
+        (set-marker (car entry) nil)))))
 
 ;;;###autoload
 (defun betterlinear-needs-review-pull-requests-org ()
