@@ -307,6 +307,27 @@ Keep this until local insertion succeeds so retrying cannot create duplicates.")
      }
    }")
 
+(defvar betterlinear--issue-comments-query
+  "query BetterLinearIssueComments($id: String!, $first: Int!, $after: String) {
+     issue(id: $id) {
+       comments(first: $first, after: $after) {
+         nodes {
+           id body url createdAt editedAt resolvedAt parentId
+           user { id name }
+           externalUser { id name }
+           botActor { id name type }
+         }
+         pageInfo { hasNextPage endCursor }
+       }
+     }
+   }")
+
+(defconst betterlinear--comments-tag "linear_comments"
+  "Org tag marking the Linear-owned comments subtree of an issue entry.")
+
+(defconst betterlinear--resolved-comment-tag "resolved"
+  "Org tag marking a resolved Linear comment.")
+
 (defvar betterlinear--issue-states-query
   "query BetterLinearIssueStates($id: String!) {
      issue(id: $id) {
@@ -726,6 +747,14 @@ request objects. Customize this if your workspace exposes different fields."
      }
    }")
 
+(defvar betterlinear--create-comment-mutation
+  "mutation BetterLinearCreateComment($input: CommentCreateInput!) {
+     commentCreate(input: $input) {
+       success
+       comment { id url createdAt parentId }
+     }
+   }")
+
 (defvar betterlinear--update-issue-mutation
   "mutation BetterLinearUpdateIssue($id: String!, $input: IssueUpdateInput!) {
      issueUpdate(id: $id, input: $input) {
@@ -787,6 +816,33 @@ an issue in Linear, or `betterlinear-capture-abort'
 (\\[betterlinear-capture-abort]) to discard the temporary buffer."
   (setq-local revert-buffer-function nil)
   (setq-local buffer-offer-save nil))
+
+(defvar-local betterlinear--comment-issue-id nil
+  "Linear issue id the current comment buffer will comment on.")
+
+(defvar-local betterlinear--comment-parent-id nil
+  "Linear comment id the current comment buffer replies to, or nil.")
+
+(defvar-local betterlinear--comment-source-marker nil
+  "Marker at the source Org issue heading for the current comment buffer.")
+
+(defvar betterlinear-comment-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map org-mode-map)
+    (define-key map (kbd "C-c C-c") #'betterlinear-comment-finalize)
+    (define-key map (kbd "C-c C-k") #'betterlinear-comment-abort)
+    map)
+  "Keymap for `betterlinear-comment-mode'.")
+
+(define-derived-mode betterlinear-comment-mode org-mode "BetterLinear Comment"
+  "Major mode for composing a Linear comment in a temporary Org buffer.
+
+The whole buffer is the comment body, written in Org and posted as Markdown.
+Post with `betterlinear-comment-finalize' (\\[betterlinear-comment-finalize]) or
+discard with `betterlinear-comment-abort' (\\[betterlinear-comment-abort])."
+  (setq-local revert-buffer-function nil)
+  (setq-local buffer-offer-save nil)
+  (add-hook 'kill-buffer-hook #'betterlinear--comment-release-marker nil t))
 
 (defun betterlinear--api-key ()
   "Return the configured Linear API key, or signal an error."
@@ -1488,6 +1544,118 @@ PRIORITY is used only when the response has no `priority' field."
     (betterlinear--insert-issue-description issue level)
     (insert "\n")))
 
+(defun betterlinear--comments-heading-p (&optional pos)
+  "Return non-nil when the heading at POS is a Linear comments subtree root."
+  (save-excursion
+    (when pos (goto-char pos))
+    (org-back-to-heading t)
+    (member betterlinear--comments-tag (org-get-tags nil t))))
+
+(defun betterlinear--comment-author (comment)
+  "Return a display name for Linear COMMENT's author.
+
+Prefer the Linear user, then an external user (for example from Slack), then
+the bot or integration.  When a bot posted on behalf of someone else, append
+\"(via BOT)\"."
+  (let* ((clean (lambda (value)
+                  (when-let* ((value (betterlinear--string value))
+                              (value (string-trim
+                                      (replace-regexp-in-string "[\n\r]+" " " value)))
+                              (_ (not (string-empty-p value))))
+                    value)))
+         (person (or (funcall clean (alist-get 'name (alist-get 'user comment)))
+                     (funcall clean (alist-get 'name (alist-get 'externalUser comment)))))
+         (bot-actor (alist-get 'botActor comment))
+         (bot (or (funcall clean (alist-get 'name bot-actor))
+                  (funcall clean (alist-get 'type bot-actor)))))
+    (cond
+     ((and person bot) (format "%s (via %s)" person bot))
+     ((or person bot))
+     (t "Unknown"))))
+
+(defun betterlinear--comment-timestamp (value)
+  "Return Linear date/time VALUE as an inactive Org timestamp, or nil."
+  (when-let* ((time (betterlinear--linear-time value)))
+    (format-time-string "[%Y-%m-%d %a %H:%M]" time)))
+
+(defun betterlinear--comment-time-less-p (a b)
+  "Return non-nil when comment A was created before comment B."
+  (let ((ta (betterlinear--linear-time (alist-get 'createdAt a)))
+        (tb (betterlinear--linear-time (alist-get 'createdAt b))))
+    (cond ((and ta tb) (time-less-p ta tb))
+          (ta t)
+          (t nil))))
+
+(defun betterlinear--comment-tree (comments)
+  "Return COMMENTS as a tree of (COMMENT . CHILDREN), oldest first.
+
+Replies are nested under their parent comment.  Replies whose parent is not in
+COMMENTS become top-level entries.  Cycles are broken."
+  (let ((ids (make-hash-table :test #'equal))
+        (children (make-hash-table :test #'equal))
+        (seen (make-hash-table :test #'equal))
+        roots)
+    (dolist (comment comments)
+      (puthash (alist-get 'id comment) t ids))
+    (dolist (comment comments)
+      (let ((parent (betterlinear--string (alist-get 'parentId comment))))
+        (if (and parent (gethash parent ids)
+                 (not (equal parent (alist-get 'id comment))))
+            (push comment (gethash parent children))
+          (push comment roots))))
+    (cl-labels ((build (nodes)
+                  (delq nil
+                        (mapcar (lambda (comment)
+                                  (let ((id (alist-get 'id comment)))
+                                    (unless (gethash id seen)
+                                      (puthash id t seen)
+                                      (cons comment (build (gethash id children))))))
+                                (sort (copy-sequence nodes)
+                                      #'betterlinear--comment-time-less-p)))))
+      (let ((tree (build roots)))
+        ;; Comments only reachable through a cycle: show them at top level.
+        (append tree
+                (build (seq-remove (lambda (c) (gethash (alist-get 'id c) seen))
+                                   comments)))))))
+
+(defun betterlinear--insert-comment (node level)
+  "Insert comment tree NODE, a (COMMENT . CHILDREN) cons, at heading LEVEL."
+  (let* ((comment (car node))
+         (timestamp (betterlinear--comment-timestamp (alist-get 'createdAt comment)))
+         (resolved (betterlinear--string (alist-get 'resolvedAt comment)))
+         (body (string-trim (or (betterlinear--string (alist-get 'body comment)) ""))))
+    (insert (make-string level ?*) " "
+            (betterlinear--comment-author comment)
+            (if timestamp (concat " " timestamp) "")
+            (if resolved (format " :%s:" betterlinear--resolved-comment-tag) "")
+            "\n")
+    (insert ":PROPERTIES:\n")
+    (betterlinear--insert-property "LINEAR_COMMENT_ID" (alist-get 'id comment))
+    (betterlinear--insert-property "LINEAR_COMMENT_URL" (alist-get 'url comment))
+    (betterlinear--insert-property "CREATED" (alist-get 'createdAt comment))
+    (betterlinear--insert-property "EDITED" (alist-get 'editedAt comment))
+    (betterlinear--insert-property "RESOLVED" resolved)
+    (insert ":END:\n")
+    (unless (string-empty-p body)
+      (insert (string-trim-right
+               (betterlinear--denormalize-org-body-headings
+                (betterlinear-markdown-to-org body)
+                level))
+              "\n"))
+    (dolist (child (cdr node))
+      (betterlinear--insert-comment child (1+ level)))))
+
+(defun betterlinear--insert-comments (comments level)
+  "Insert Linear COMMENTS as a tagged comments subtree at heading LEVEL.
+
+Top-level comments are inserted at LEVEL + 1, oldest first, with replies nested
+beneath them.  Insert nothing when COMMENTS is empty."
+  (when comments
+    (insert (make-string level ?*)
+            (format " Comments (%d) :%s:\n" (length comments) betterlinear--comments-tag))
+    (dolist (node (betterlinear--comment-tree comments))
+      (betterlinear--insert-comment node (1+ level)))))
+
 (defun betterlinear--todo-keywords-for-issues (issues)
   "Return unique Org TODO keywords for the Linear state names in ISSUES."
   (let (keywords)
@@ -1626,7 +1794,9 @@ and sibling order, and tolerate malformed parent cycles without looping."
 (defun betterlinear--org-entry-drafts-map ()
   "Return local draft subtrees keyed by their owning Linear issue id.
 
-Values are lists of (RELATIVE-LEVEL TEXT) pairs."
+Values are lists of (RELATIVE-LEVEL TEXT COMMENTS-P) entries.  COMMENTS-P is
+non-nil for the Linear comments subtree, which is preserved like a draft but
+can be fetched again, so losing it is not an error."
   (let ((drafts (make-hash-table :test #'equal)))
     (when (derived-mode-p 'org-mode)
       (org-map-entries
@@ -1643,7 +1813,8 @@ Values are lists of (RELATIVE-LEVEL TEXT) pairs."
                    (push (list (- (nth 2 region) level)
                                (betterlinear--substring-without-regions
                                 (car region) (nth 1 region)
-                                (betterlinear--current-entry-child-regions t)))
+                                (betterlinear--current-entry-child-regions t))
+                               (betterlinear--comments-heading-p (car region)))
                          children))))
              (when children (puthash id (nreverse children) drafts)))))))
     drafts))
@@ -1672,8 +1843,9 @@ refuse to erase drafts whose owning issue is absent from the new results."
            (planning-map (betterlinear--org-entry-planning-map))
            (priority-map (betterlinear--org-entry-priority-map)))
       (maphash
-       (lambda (id _drafts)
-         (unless (seq-find (lambda (issue) (equal id (alist-get 'id issue))) issues)
+       (lambda (id drafts)
+         (unless (or (seq-every-p (lambda (draft) (nth 2 draft)) drafts)
+                     (seq-find (lambda (issue) (equal id (alist-get 'id issue))) issues))
            (user-error "Issue %s has local sub-issue drafts; create or move them before refreshing this view" id)))
        drafts-map)
       (atomic-change-group
@@ -1940,10 +2112,12 @@ Each value is a priority character (e.g. ?A) for entries that have an explicit
   "Return outermost sub-issue regions below the current heading.
 
 Each region is (BEG END LEVEL).  A heading with its own LINEAR_ID or any
-configured Org TODO keyword (including done keywords) is a sub-issue.
-Ordinary headings are description content.  Ignore headings in source blocks.
-When EXISTING-ONLY is non-nil, find only LINEAR_ID entries, including those
-nested beneath drafts."
+configured Org TODO keyword (including done keywords) is a sub-issue.  The
+Linear comments subtree (tagged `linear_comments') is also returned so it is
+excluded from descriptions and preserved on refresh.  Ordinary headings are
+description content.  Ignore headings in source blocks.  When EXISTING-ONLY
+is non-nil, find only LINEAR_ID entries, including those nested beneath
+drafts."
   (save-excursion
     (org-back-to-heading t)
     (let ((root (point)) (covered-until (point)) regions)
@@ -1955,7 +2129,9 @@ nested beneath drafts."
                   (end (org-element-property :end headline)))
               (when (and (> beg root) (>= beg covered-until)
                          (or (and (not existing-only)
-                                  (org-element-property :todo-keyword headline))
+                                  (or (org-element-property :todo-keyword headline)
+                                      (member betterlinear--comments-tag
+                                              (org-element-property :tags headline))))
                              (org-entry-get beg "LINEAR_ID" nil)))
                 (push (list beg end (org-element-property :level headline)) regions)
                 (setq covered-until end))))))
@@ -1972,7 +2148,8 @@ nested beneath drafts."
 
 The description starts after the entry heading, planning line, and property
 drawer and is converted from Org to Markdown.  Ordinary child headings are
-included, but sub-issue subtrees (LINEAR_ID or TODO headings) are excluded.
+included, but sub-issue subtrees (LINEAR_ID or TODO headings) and the Linear
+comments subtree are excluded.
 All drawers are excluded.  Child heading levels are normalized relative to
 the current entry before conversion."
   (unless (derived-mode-p 'org-mode)
@@ -2660,6 +2837,46 @@ cycles.  This explicit operation is not used by filtered list queries."
                 (error "Invalid pagination cursor for sub-issues of %s" parent-id))
               (puthash after t cursors))))))
     (nreverse result)))
+
+(defun betterlinear-issue-comments (issue-id)
+  "Return all comments on Linear ISSUE-ID as a flat list, oldest first.
+
+Fetch every page.  Replies are included; their `parentId' names the comment
+they reply to."
+  (let ((after nil) (more t) (cursors (make-hash-table :test #'equal)) result)
+    (while more
+      (let* ((data (betterlinear--graphql
+                    betterlinear--issue-comments-query
+                    `((id . ,issue-id) (first . ,betterlinear-issues-page-size)
+                      (after . ,after))))
+             (issue (or (alist-get 'issue data)
+                        (error "Linear issue not found: %s" issue-id)))
+             (connection (alist-get 'comments issue))
+             (page-info (alist-get 'pageInfo connection)))
+        (setq result (append result (alist-get 'nodes connection)))
+        (setq more (eq (alist-get 'hasNextPage page-info) t)
+              after (alist-get 'endCursor page-info))
+        (when more
+          (when (or (null after) (gethash after cursors))
+            (error "Invalid pagination cursor for comments of %s" issue-id))
+          (puthash after t cursors))))
+    (sort result #'betterlinear--comment-time-less-p)))
+
+(defun betterlinear-create-comment (issue-id body &optional parent-id)
+  "Post Markdown BODY as a comment on Linear ISSUE-ID and return the comment.
+
+When PARENT-ID is non-nil, post the comment as a reply in that comment's
+thread.  Linear threads are one level deep, so PARENT-ID should be the thread's
+top-level comment."
+  (let* ((input `((issueId . ,issue-id)
+                  (body . ,body)
+                  ,@(when parent-id `((parentId . ,parent-id)))))
+         (data (betterlinear--graphql betterlinear--create-comment-mutation
+                                      `((input . ,input))))
+         (payload (alist-get 'commentCreate data)))
+    (unless (eq (alist-get 'success payload) t)
+      (error "Linear did not create the comment"))
+    (alist-get 'comment payload)))
 
 (defun betterlinear--issue-with-description (issue description)
   "Return ISSUE with DESCRIPTION as its Markdown description when non-empty.
@@ -3524,6 +3741,157 @@ Return the number of fetched descendants."
                      (length issues) (if (= (length issues) 1) "" "s"))
             (length issues)))
       (betterlinear--release-issue-markers markers))))
+
+(defun betterlinear--goto-enclosing-issue-heading ()
+  "Move to the nearest heading at or above point with its own LINEAR_ID."
+  (unless (derived-mode-p 'org-mode)
+    (user-error "This command must be run from an Org buffer"))
+  (org-back-to-heading t)
+  (while (not (org-entry-get (point) "LINEAR_ID" nil))
+    (unless (org-up-heading-safe)
+      (user-error "No enclosing Org entry with a LINEAR_ID property")))
+  (org-entry-get (point) "LINEAR_ID" nil))
+
+;;;###autoload
+(defun betterlinear-fetch-comments ()
+  "Fetch and display the comments of the Linear issue at point.
+
+Point may be anywhere inside the issue entry, including its comments.  The
+comments are shown in a `Comments' child heading tagged `linear_comments',
+oldest first, with replies nested beneath the comment they answer and resolved
+threads tagged `resolved'.  An existing comments subtree is replaced in place;
+otherwise it is inserted after the description, before any sub-issues.  The
+comments subtree is never sent to Linear as part of the description.  Fetch
+everything before editing.  Return the number of fetched comments."
+  (interactive)
+  (let (id comments)
+    (save-excursion
+      (setq id (betterlinear--goto-enclosing-issue-heading)))
+    (setq comments (betterlinear-issue-comments id))
+    (save-excursion
+      (save-restriction
+        (widen)
+        (betterlinear--goto-enclosing-issue-heading)
+        (let* ((inhibit-read-only t)
+               (level (org-outline-level))
+               (regions (betterlinear--current-entry-child-regions))
+               (existing (seq-filter (lambda (region)
+                                       (betterlinear--comments-heading-p (car region)))
+                                     regions))
+               (insert-at (cond (existing (car (car existing)))
+                                (regions (car (car regions)))
+                                (t (save-excursion (org-end-of-subtree t t) (point))))))
+          (atomic-change-group
+            ;; Delete backwards so earlier positions remain valid.
+            (dolist (region (reverse existing))
+              (delete-region (car region) (nth 1 region)))
+            (goto-char insert-at)
+            (unless (bolp) (insert "\n"))
+            (betterlinear--insert-comments comments (1+ level))))))
+    (message "Fetched %d Linear comment%s"
+             (length comments) (if (= (length comments) 1) "" "s"))
+    (length comments)))
+
+(defun betterlinear--comment-thread-at-point ()
+  "Return (ID . AUTHOR) of the top-level comment thread containing point, or nil.
+
+Walk up from point; the outermost heading with a LINEAR_COMMENT_ID below the
+issue is the thread root."
+  (save-excursion
+    (when (ignore-errors (org-back-to-heading t) t)
+      (let (thread)
+        (while (progn
+                 (when-let* ((id (org-entry-get (point) "LINEAR_COMMENT_ID" nil)))
+                   (setq thread
+                         (cons id (string-trim
+                                   (replace-regexp-in-string
+                                    "[[:space:]]*\\[[^]]*\\][[:space:]]*\\'" ""
+                                    (org-get-heading t t t t))))))
+                 (and (not (org-entry-get (point) "LINEAR_ID" nil))
+                      (org-up-heading-safe))))
+        thread))))
+
+(defun betterlinear--comment-release-marker ()
+  "Release the source marker of the current comment buffer."
+  (when (markerp betterlinear--comment-source-marker)
+    (set-marker betterlinear--comment-source-marker nil)))
+
+;;;###autoload
+(defun betterlinear-add-comment (&optional new-thread)
+  "Compose a comment on the Linear issue at point in a temporary Org buffer.
+
+Point may be anywhere inside the issue entry.  When point is inside a fetched
+comment, the new comment is a reply in that comment's thread; with prefix
+argument NEW-THREAD, always start a new top-level comment instead.
+
+Write the comment in Org, then post it with \\<betterlinear-comment-mode-map>\\[betterlinear-comment-finalize] or discard it with
+\\[betterlinear-comment-abort].  After posting, the issue's comments are fetched
+again as with `betterlinear-fetch-comments'."
+  (interactive "P")
+  (let* ((thread (unless new-thread (betterlinear--comment-thread-at-point)))
+         heading-marker issue-id identifier)
+    (save-excursion
+      (setq issue-id (betterlinear--goto-enclosing-issue-heading))
+      (setq identifier (or (org-entry-get (point) "LINEAR_IDENTIFIER" nil) issue-id))
+      (setq heading-marker (copy-marker (point))))
+    (let ((buffer (generate-new-buffer (format "*Linear Comment %s*" identifier))))
+      (with-current-buffer buffer
+        (betterlinear-comment-mode)
+        (setq betterlinear--comment-issue-id issue-id
+              betterlinear--comment-parent-id (car thread)
+              betterlinear--comment-source-marker heading-marker)
+        (setq header-line-format
+              (format "%s %s — C-c C-c to post, C-c C-k to abort"
+                      (if thread
+                          (format "Reply to %s on" (cdr thread))
+                        "Comment on")
+                      identifier))
+        (set-buffer-modified-p nil))
+      (pop-to-buffer buffer)
+      buffer)))
+
+(defun betterlinear-comment-finalize ()
+  "Post the current comment buffer to Linear and refresh the source comments.
+
+The comment is posted before the buffer is closed.  If refreshing the source
+entry fails afterwards, the comment stays posted; run
+`betterlinear-fetch-comments' to show it."
+  (interactive)
+  (unless (derived-mode-p 'betterlinear-comment-mode)
+    (user-error "This command must be run from a BetterLinear comment buffer"))
+  (let* ((org (string-trim (buffer-substring-no-properties (point-min) (point-max))))
+         (_ (when (string-empty-p org) (user-error "Comment is empty")))
+         (buffer (current-buffer))
+         (issue-id betterlinear--comment-issue-id)
+         (parent-id betterlinear--comment-parent-id)
+         (marker (and (markerp betterlinear--comment-source-marker)
+                      (marker-buffer betterlinear--comment-source-marker)
+                      (copy-marker betterlinear--comment-source-marker)))
+         (comment (betterlinear-create-comment
+                   issue-id (betterlinear-org-to-markdown org) parent-id)))
+    (betterlinear--kill-capture-buffer buffer)
+    (unwind-protect
+        (if (not marker)
+            (message "Posted Linear comment; the source buffer is gone")
+          (condition-case err
+              (with-current-buffer (marker-buffer marker)
+                (save-excursion
+                  (goto-char marker)
+                  (betterlinear-fetch-comments))
+                (message "Posted Linear %s" (if parent-id "reply" "comment")))
+            (error
+             (message "Posted Linear comment, but refreshing comments failed: %s"
+                      (error-message-string err)))))
+      (when marker (set-marker marker nil)))
+    comment))
+
+(defun betterlinear-comment-abort ()
+  "Discard the current comment buffer without posting anything."
+  (interactive)
+  (unless (derived-mode-p 'betterlinear-comment-mode)
+    (user-error "This command must be run from a BetterLinear comment buffer"))
+  (betterlinear--kill-capture-buffer (current-buffer))
+  (message "Discarded Linear comment"))
 
 ;;;###autoload
 (defun betterlinear-refresh-all-issues ()

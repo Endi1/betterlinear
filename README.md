@@ -25,6 +25,8 @@ An Emacs package for working with [Linear](https://linear.app) issues from Org m
 - Create a Linear issue from an Org entry.
 - Capture a new Linear issue in a temporary Org buffer without saving an Org entry.
 - Copy the Linear/git branch name for the issue at point.
+- Show an issue's comments, threaded and oldest first, inside its Org entry.
+- Add comments and thread replies to an issue from Emacs.
 - Fetch pull requests that need your review.
 - Convert descriptions between Markdown and Org.
   - Uses Pandoc when available.
@@ -347,6 +349,53 @@ Creation affects **only the selected draft** and preserves its nested drafts. Cr
 
 `revert-buffer` on generated issue views preserves drafts under issues still in the results, adjusting their heading levels if needed. If a draft's owner disappears from the results, refresh is refused rather than discarding the draft. Create or move those drafts first.
 
+### Show issue comments
+
+Run this anywhere inside a Linear-backed entry, including inside its comments:
+
+```elisp
+M-x betterlinear-fetch-comments
+```
+
+This fetches every comment on the issue and shows them in a `Comments` child heading tagged `:linear_comments:`. The heading goes after the description and before any sub-issues:
+
+```org
+* IN-PROGRESS [#B] ENG-123 Fix login redirect
+:PROPERTIES: ...
+Description...
+** Comments (3) :linear_comments:
+*** Jane Doe [2026-01-01 Thu 11:00] :resolved:
+:PROPERTIES:
+:LINEAR_COMMENT_ID: ...
+:LINEAR_COMMENT_URL: ...
+:END:
+I think this is the cookie domain.
+**** Bob Smith [2026-01-02 Fri 11:00]
+Confirmed.
+*** GitHub [2026-01-03 Sat 11:00]
+...
+```
+
+- Comments are ordered oldest first. Replies are nested under the comment they answer.
+- Comment bodies are converted from Markdown to Org.
+- Resolved threads are tagged `:resolved:`.
+- Bot and integration comments are shown under the bot's name. Comments synced from tools like Slack are shown as `Name (via Slack)`.
+- Timestamps are inactive, so comments do not appear in the agenda.
+
+Running the command again replaces the comments subtree in place. Comments are fetched only by this command, not by list views or `betterlinear-refresh-issue-at-point`. Refreshing the issue or its list view keeps the existing comments subtree unchanged, so it can become stale. The comments subtree is never sent to Linear as part of the description.
+
+### Add a comment
+
+Run this anywhere inside a Linear-backed entry:
+
+```elisp
+M-x betterlinear-add-comment
+```
+
+This opens a temporary Org buffer. The whole buffer is the comment body. It is written in Org and posted as Markdown. Press `C-c C-c` to post it or `C-c C-k` to discard it. After posting, the issue's comments are fetched again, so the new comment shows up in place.
+
+If point is inside a fetched comment, the new comment is posted as a reply in that comment's thread. Linear threads are one level deep, so replies always go to the thread's top-level comment. The buffer's header line shows who you are replying to. With a prefix argument (`C-u M-x betterlinear-add-comment`), a new top-level comment is started instead.
+
 ### Update a Linear issue from an Org entry
 
 ```elisp
@@ -356,7 +405,7 @@ M-x betterlinear-update-issue-from-org-entry
 Updates the issue identified by the current entry's `LINEAR_ID` property:
 
 - Org heading → Linear title (the generated identifier link is omitted)
-- Org body and ordinary child headings → Linear description, converted to Markdown; sub-issue subtrees are excluded
+- Org body and ordinary child headings → Linear description, converted to Markdown; sub-issue subtrees and the comments subtree are excluded
 - Org TODO keyword → matching Linear workflow state
 
 The entry is replaced with the updated issue while preserving its heading level,
@@ -489,6 +538,8 @@ Interactive commands:
 | `betterlinear-refresh-issue-at-point` | Refresh current Org entry from Linear. |
 | `betterlinear-refresh-all-issues` | Refresh all Linear entries in the current Org buffer. |
 | `betterlinear-fetch-sub-issues` | Fetch and display an issue's complete descendant tree. |
+| `betterlinear-fetch-comments` | Fetch and display the issue's comments as a threaded Org subtree. |
+| `betterlinear-add-comment` | Compose and post a comment, or a reply to the comment thread at point. |
 | `betterlinear-add-sub-issue` | Insert a local TODO sub-issue draft under the current issue. |
 | `betterlinear-create-sub-issue-from-org-entry` | Create the current draft under its enclosing Linear issue. |
 | `betterlinear-update-issue-from-org-entry` | Update a Linear issue from the current Org entry. |
@@ -523,6 +574,8 @@ Lower-level functions:
 | `betterlinear-viewer` | Fetch authenticated Linear user. |
 | `betterlinear-create-issue` | Create an issue; optional fifth argument selects its parent. |
 | `betterlinear-sub-issues` | Fetch all descendants of an issue as flat Lisp data. |
+| `betterlinear-issue-comments` | Fetch all comments on an issue as flat Lisp data, oldest first. |
+| `betterlinear-create-comment` | Post a Markdown comment (optionally a reply) on an issue. |
 | `betterlinear-update-issue` | Update an issue's title, description, and optionally its state. |
 | `betterlinear-set-issue-state` | Set issue state by state id. |
 | `betterlinear-set-issue-project` | Set issue project by project id. |
